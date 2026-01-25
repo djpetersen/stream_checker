@@ -1,6 +1,5 @@
 """Input validation and security checks"""
 
-import re
 import ipaddress
 from urllib.parse import urlparse
 from typing import List, Tuple, Optional

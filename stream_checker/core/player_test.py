@@ -5,9 +5,7 @@ import threading
 import subprocess
 import platform
 import os
-import signal
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 import logging
 
 logger = logging.getLogger("stream_checker")
@@ -29,6 +27,10 @@ class PlayerTester:
         playback_duration: int = 5,
         connection_timeout: int = 30
     ):
+        if playback_duration <= 0:
+            raise ValueError("playback_duration must be positive")
+        if connection_timeout <= 0:
+            raise ValueError("connection_timeout must be positive")
         self.playback_duration = playback_duration
         self.connection_timeout = connection_timeout
         self.vlc_instance = None
@@ -189,18 +191,21 @@ class PlayerTester:
                     self.media_player.release()
                 if self.vlc_instance:
                     self.vlc_instance.release()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Error during VLC cleanup: {e}")
         
         return result
     
     def _on_playing(self, event):
         """Callback when playback starts"""
+        # Note: VLC callbacks are called from VLC's thread, but VLC handles thread safety
+        # These callbacks are typically single-threaded per instance
         self._playback_started = True
         logger.debug("VLC playback started")
     
     def _on_buffering(self, event):
         """Callback when buffering occurs"""
+        # Note: VLC callbacks are thread-safe within VLC's context
         self._buffering_events += 1
         logger.debug(f"VLC buffering event #{self._buffering_events}")
     
@@ -227,6 +232,10 @@ class PlayerTesterFallback:
         playback_duration: int = 5,
         connection_timeout: int = 30
     ):
+        if playback_duration <= 0:
+            raise ValueError("playback_duration must be positive")
+        if connection_timeout <= 0:
+            raise ValueError("connection_timeout must be positive")
         self.playback_duration = playback_duration
         self.connection_timeout = connection_timeout
     
@@ -248,7 +257,7 @@ class PlayerTesterFallback:
                     vlc_path = which_result.stdout.decode().strip()
                     if vlc_path:
                         paths.insert(0, vlc_path)
-            except:
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 pass
         elif system == "Linux":
             paths = ["/usr/bin/vlc", "/usr/local/bin/vlc", "vlc"]
@@ -321,8 +330,8 @@ class PlayerTesterFallback:
                 if process.poll() is None:  # Process still running
                     try:
                         process.terminate()
-                    except:
-                        pass
+                    except (OSError, ProcessLookupError) as e:
+                        logger.debug(f"Error terminating VLC process: {e}")
             
             timer_thread = threading.Thread(target=stop_vlc, daemon=True)
             timer_thread.start()

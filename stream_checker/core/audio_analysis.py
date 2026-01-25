@@ -4,9 +4,8 @@ import os
 import subprocess
 import tempfile
 import numpy as np
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, Tuple
 import logging
-import struct
 
 logger = logging.getLogger("stream_checker")
 
@@ -20,6 +19,12 @@ class AudioAnalyzer:
         silence_threshold_db: float = -40.0,
         silence_min_duration: float = 2.0
     ):
+        if sample_duration <= 0:
+            raise ValueError("sample_duration must be positive")
+        if not (-100 <= silence_threshold_db <= 0):
+            raise ValueError("silence_threshold_db must be between -100 and 0")
+        if silence_min_duration <= 0:
+            raise ValueError("silence_min_duration must be positive")
         self.sample_duration = sample_duration
         self.silence_threshold_db = silence_threshold_db
         self.silence_min_duration = silence_min_duration
@@ -80,10 +85,10 @@ class AudioAnalyzer:
         finally:
             # Clean up temp file
             try:
-                if os.path.exists(audio_file):
+                if audio_file and os.path.exists(audio_file):
                     os.unlink(audio_file)
-            except:
-                pass
+            except (OSError, PermissionError) as e:
+                logger.debug(f"Could not delete temp file {audio_file}: {e}")
         
         return result
     
@@ -134,23 +139,42 @@ class AudioAnalyzer:
                 timeout=timeout
             )
             
-            if process.returncode == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                return temp_path
+            if process.returncode == 0 and os.path.exists(temp_path):
+                file_size = os.path.getsize(temp_path)
+                if file_size > 0:
+                    return temp_path
+                else:
+                    logger.warning(f"ffmpeg produced empty file: {temp_path}")
+                    try:
+                        os.unlink(temp_path)
+                    except (OSError, PermissionError):
+                        pass
+                    return None
             else:
-                logger.error(f"ffmpeg failed: {process.stderr.decode('utf-8', errors='ignore')}")
+                error_msg = process.stderr.decode('utf-8', errors='ignore') if process.stderr else "Unknown error"
+                logger.error(f"ffmpeg failed (code {process.returncode}): {error_msg}")
                 if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+                    try:
+                        os.unlink(temp_path)
+                    except (OSError, PermissionError):
+                        pass
                 return None
         
         except subprocess.TimeoutExpired:
             logger.error("ffmpeg timeout")
             if os.path.exists(temp_path):
-                os.unlink(temp_path)
+                try:
+                    os.unlink(temp_path)
+                except (OSError, PermissionError):
+                    pass
             return None
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             if os.path.exists(temp_path):
-                os.unlink(temp_path)
+                try:
+                    os.unlink(temp_path)
+                except (OSError, PermissionError):
+                    pass
             return None
     
     def _load_audio_raw(self, audio_file: str) -> Tuple[Optional[np.ndarray], int, int]:
@@ -184,15 +208,40 @@ class AudioAnalyzer:
             
             # Convert bytes to numpy array
             raw_data = process.stdout
+            if len(raw_data) == 0:
+                logger.error("ffmpeg produced no audio data")
+                return None, 0, 0
+            
             samples = np.frombuffer(raw_data, dtype=np.int16)
+            
+            if len(samples) == 0:
+                logger.error("No audio samples extracted")
+                return None, 0, 0
             
             # Handle stereo (interleaved)
             sample_rate = 44100
             channels = 2
-            if channels == 2:
-                samples = samples.reshape(-1, 2)
-                # Convert to mono by averaging
-                samples = np.mean(samples, axis=1).astype(np.int16)
+            if channels == 2 and len(samples) >= 2:
+                try:
+                    samples_reshaped = samples.reshape(-1, 2)
+                    if len(samples_reshaped) > 0:
+                        # Convert to mono by averaging (keep as float for precision)
+                        samples = np.mean(samples_reshaped, axis=1)
+                    else:
+                        logger.warning("Empty reshaped samples array")
+                        return None, 0, 0
+                except ValueError:
+                    # If reshape fails (odd number of samples), pad with zero
+                    if len(samples) % 2 != 0:
+                        samples_padded = np.append(samples, 0)
+                        samples_reshaped = samples_padded.reshape(-1, 2)
+                        if len(samples_reshaped) > 0:
+                            samples = np.mean(samples_reshaped, axis=1)
+                        else:
+                            logger.warning("Empty reshaped samples array after padding")
+                            return None, 0, 0
+                    else:
+                        raise
             
             return samples, sample_rate, 1  # Return as mono
             
@@ -202,9 +251,21 @@ class AudioAnalyzer:
     
     def _detect_silence(self, samples: np.ndarray, sample_rate: int, channels: int, result: Dict[str, Any]):
         """Detect silence periods in audio"""
+        # Validate inputs
+        if sample_rate <= 0:
+            logger.warning(f"Invalid sample rate: {sample_rate}")
+            return
+        if len(samples) == 0:
+            logger.warning("No samples provided for silence detection")
+            return
+        
         # Calculate RMS (Root Mean Square) for each window
-        window_size = int(sample_rate * 0.1)  # 100ms windows
+        window_size = max(1, int(sample_rate * 0.1))  # 100ms windows, minimum 1
         num_windows = len(samples) // window_size
+        
+        if num_windows == 0:
+            logger.warning("No windows available for silence detection")
+            return
         
         silence_periods = []
         total_silence_samples = 0
@@ -261,7 +322,11 @@ class AudioAnalyzer:
         
         # Calculate silence percentage
         total_samples = len(samples)
-        silence_percentage = (total_silence_samples / total_samples) * 100 if total_samples > 0 else 0
+        if total_samples > 0:
+            silence_percentage = (total_silence_samples / total_samples) * 100
+        else:
+            silence_percentage = 0.0
+            logger.warning("No audio samples available for silence detection")
         
         result["silence_detection"] = {
             "silence_detected": len(significant_periods) > 0,
@@ -279,6 +344,10 @@ class AudioAnalyzer:
     
     def _analyze_quality(self, samples: np.ndarray, sample_rate: int, channels: int, result: Dict[str, Any]):
         """Analyze audio quality metrics"""
+        if len(samples) == 0:
+            logger.warning("No samples provided for quality analysis")
+            return
+        
         # Normalize to [-1, 1] range (16-bit signed integer)
         max_value = 2 ** 15
         samples_normalized = samples.astype(np.float32) / max_value
@@ -315,13 +384,16 @@ class AudioAnalyzer:
         # Check for repetitive patterns that might indicate error messages
         # This is a simplified version - full implementation would use speech recognition
         
+        if len(samples) == 0 or sample_rate <= 0:
+            return
+        
         # Normalize to [-1, 1] range
         max_value = 2 ** 15
         samples_normalized = samples.astype(np.float32) / max_value
         
         # Check for repetitive patterns (autocorrelation)
         # Simplified: check if audio has very low variance (repetitive)
-        window_size = int(sample_rate * 1.0)  # 1 second windows
+        window_size = max(1, int(sample_rate * 1.0))  # 1 second windows, minimum 1
         num_windows = len(samples_normalized) // window_size
         
         if num_windows >= 2:
@@ -330,21 +402,27 @@ class AudioAnalyzer:
                 for i in range(num_windows)
             ]
             
-            # Calculate variance for each window
-            variances = [np.var(w) for w in windows]
+            # Filter out empty windows and calculate variance for each window
+            variances = [np.var(w) for w in windows if len(w) > 0]
             
             # Check if variances are very similar (repetitive pattern)
             if len(variances) > 1:
-                variance_std = np.std(variances)
-                variance_mean = np.mean(variances)
-                
-                # Low variance and low variance of variances suggests repetition
-                if variance_mean < 0.01 and variance_std < 0.005:
-                    result["error_detection"]["repetitive_pattern_detected"] = True
-                    result["error_detection"]["error_detected"] = True
-                    result["error_detection"]["error_messages"].append(
-                        "Repetitive audio pattern detected (possible error message)"
-                    )
+                try:
+                    variance_std = np.std(variances)
+                    variance_mean = np.mean(variances)
+                    
+                    # Check for valid numeric values (not NaN or inf)
+                    if not (np.isnan(variance_std) or np.isnan(variance_mean) or 
+                            np.isinf(variance_std) or np.isinf(variance_mean)):
+                        # Low variance and low variance of variances suggests repetition
+                        if variance_mean < 0.01 and variance_std < 0.005:
+                            result["error_detection"]["repetitive_pattern_detected"] = True
+                            result["error_detection"]["error_detected"] = True
+                            result["error_detection"]["error_messages"].append(
+                                "Repetitive audio pattern detected (possible error message)"
+                            )
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Error calculating variance statistics: {e}")
         
         # Note: Full speech recognition would require additional libraries
         # and is marked as optional in the spec

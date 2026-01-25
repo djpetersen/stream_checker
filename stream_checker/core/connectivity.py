@@ -3,6 +3,7 @@
 import time
 import ssl
 import socket
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
@@ -13,7 +14,8 @@ import mutagen
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
-from mutagen.id3 import ID3NoHeaderError
+
+logger = logging.getLogger("stream_checker")
 
 
 class ConnectivityChecker:
@@ -85,6 +87,7 @@ class ConnectivityChecker:
         """Check HTTP/HTTPS connectivity"""
         start_time = time.time()
         
+        response = None
         try:
             response = requests.head(
                 url,
@@ -96,13 +99,14 @@ class ConnectivityChecker:
             
             response_time = int((time.time() - start_time) * 1000)
             
-            return {
+            result = {
                 "status": "success",
                 "response_time_ms": response_time,
                 "http_status": response.status_code,
                 "content_type": response.headers.get("Content-Type", "unknown"),
                 "final_url": response.url if response.url != url else None
             }
+            return result
         
         except requests.exceptions.Timeout:
             return {
@@ -131,12 +135,24 @@ class ConnectivityChecker:
                 "error": str(e),
                 "response_time_ms": int((time.time() - start_time) * 1000)
             }
+        finally:
+            # Ensure response is closed when using stream=True
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
     
     def _check_ssl_certificate(self, url: str) -> Dict[str, Any]:
         """Check SSL/TLS certificate"""
         try:
             parsed = urlparse(url)
             hostname = parsed.hostname
+            if not hostname:
+                return {
+                    "valid": False,
+                    "error": "No hostname in URL"
+                }
             port = parsed.port or 443
             
             # Create SSL context
@@ -151,15 +167,20 @@ class ConnectivityChecker:
             # Extract certificate information
             issuer = cert.issuer.rfc4514_string()
             subject = cert.subject.rfc4514_string()
-            # Use UTC-aware datetime methods to avoid deprecation warnings
-            not_after = cert.not_valid_after_utc if hasattr(cert, 'not_valid_after_utc') else cert.not_valid_after.replace(tzinfo=timezone.utc)
-            not_before = cert.not_valid_before_utc if hasattr(cert, 'not_valid_before_utc') else cert.not_valid_before.replace(tzinfo=timezone.utc)
             
-            # Ensure timezone-aware
-            if not_after.tzinfo is None:
-                not_after = not_after.replace(tzinfo=timezone.utc)
-            if not_before.tzinfo is None:
-                not_before = not_before.replace(tzinfo=timezone.utc)
+            # Get certificate dates (handle both old and new API)
+            try:
+                # Try new UTC-aware properties first (cryptography >= 41.0.0)
+                not_after = cert.not_valid_after_utc
+                not_before = cert.not_valid_before_utc
+            except AttributeError:
+                # Fall back to old properties and make timezone-aware
+                not_after = cert.not_valid_after
+                not_before = cert.not_valid_before
+                if not_after.tzinfo is None:
+                    not_after = not_after.replace(tzinfo=timezone.utc)
+                if not_before.tzinfo is None:
+                    not_before = not_before.replace(tzinfo=timezone.utc)
             
             # Check if expired
             now = datetime.now(timezone.utc)
@@ -184,7 +205,14 @@ class ConnectivityChecker:
                 "self_signed": is_self_signed
             }
         
+        except (socket.error, ssl.SSLError, OSError) as e:
+            logger.debug(f"SSL certificate check error: {e}")
+            return {
+                "valid": False,
+                "error": str(e)
+            }
         except Exception as e:
+            logger.error(f"Unexpected error checking SSL certificate: {e}")
             return {
                 "valid": False,
                 "error": str(e)
@@ -200,6 +228,7 @@ class ConnectivityChecker:
             "container": None
         }
         
+        response = None
         try:
             # Try to get a small sample of the stream
             response = requests.get(
@@ -215,82 +244,135 @@ class ConnectivityChecker:
                 import tempfile
                 max_bytes = 16384  # Limit to 16KB
                 bytes_read = 0
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        tmp.write(chunk)
-                        bytes_read += len(chunk)
-                        if bytes_read >= max_bytes or len(chunk) < 8192:  # Last chunk or limit reached
-                            break
-                    tmp_path = tmp.name
-                
+                tmp_path = None
                 try:
-                    # Try to read with mutagen
-                    audio_file = mutagen.File(tmp_path)
-                    
-                    if audio_file:
-                        # Extract parameters based on file type
-                        if isinstance(audio_file, MP3):
-                            params["codec"] = "MP3"
-                            params["container"] = "MP3"
-                            if hasattr(audio_file.info, 'bitrate'):
-                                params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                            if hasattr(audio_file.info, 'sample_rate'):
-                                params["sample_rate_hz"] = audio_file.info.sample_rate
-                            if hasattr(audio_file.info, 'channels'):
-                                channels = audio_file.info.channels
-                                params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                        
-                        elif isinstance(audio_file, MP4):
-                            params["codec"] = "AAC"
-                            params["container"] = "MP4"
-                            if hasattr(audio_file.info, 'bitrate'):
-                                params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                            if hasattr(audio_file.info, 'sample_rate'):
-                                params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                            if hasattr(audio_file.info, 'channels'):
-                                channels = audio_file.info.channels
-                                params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                        
-                        elif isinstance(audio_file, OggVorbis):
-                            params["codec"] = "Vorbis"
-                            params["container"] = "OGG"
-                            if hasattr(audio_file.info, 'bitrate'):
-                                params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                            if hasattr(audio_file.info, 'sample_rate'):
-                                params["sample_rate_hz"] = audio_file.info.sample_rate
-                            if hasattr(audio_file.info, 'channels'):
-                                channels = audio_file.info.channels
-                                params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                        
-                        else:
-                            # Generic mutagen file
-                            params["codec"] = type(audio_file).__name__
-                            if hasattr(audio_file.info, 'bitrate'):
-                                params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                            if hasattr(audio_file.info, 'sample_rate'):
-                                params["sample_rate_hz"] = audio_file.info.sample_rate
+                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:  # Skip empty chunks
+                                tmp.write(chunk)
+                                bytes_read += len(chunk)
+                                if bytes_read >= max_bytes or len(chunk) < 8192:  # Last chunk or limit reached
+                                    break
+                        tmp_path = tmp.name
                 
-                except Exception as e:
-                    # Mutagen couldn't read it, might be a stream
-                    pass
-                finally:
-                    # Clean up temp file
-                    import os
+                    # Try to read with mutagen
                     try:
-                        os.unlink(tmp_path)
-                    except:
-                        pass
+                        audio_file = mutagen.File(tmp_path)
+                        
+                        if audio_file:
+                            # Extract parameters based on file type
+                            if isinstance(audio_file, MP3):
+                                params["codec"] = "MP3"
+                                params["container"] = "MP3"
+                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                    try:
+                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                    except (TypeError, ZeroDivisionError):
+                                        pass
+                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                    try:
+                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                    except (TypeError, ValueError):
+                                        pass
+                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                    try:
+                                        channels = int(audio_file.info.channels)
+                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                    except (TypeError, ValueError):
+                                        pass
+                            
+                            elif isinstance(audio_file, MP4):
+                                params["codec"] = "AAC"
+                                params["container"] = "MP4"
+                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                    try:
+                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                    except (TypeError, ZeroDivisionError):
+                                        pass
+                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                    try:
+                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                    except (TypeError, ValueError):
+                                        pass
+                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                    try:
+                                        channels = int(audio_file.info.channels)
+                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                    except (TypeError, ValueError):
+                                        pass
+                            
+                            elif isinstance(audio_file, OggVorbis):
+                                params["codec"] = "Vorbis"
+                                params["container"] = "OGG"
+                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                    try:
+                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                    except (TypeError, ZeroDivisionError):
+                                        pass
+                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                    try:
+                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                    except (TypeError, ValueError):
+                                        pass
+                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                    try:
+                                        channels = int(audio_file.info.channels)
+                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                    except (TypeError, ValueError):
+                                        pass
+                            
+                            else:
+                                # Generic mutagen file
+                                params["codec"] = type(audio_file).__name__
+                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                    try:
+                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                    except (TypeError, ZeroDivisionError):
+                                        pass
+                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                    try:
+                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                    except (TypeError, ValueError):
+                                        pass
+                    
+                    except Exception as e:
+                        # Mutagen couldn't read it, might be a stream
+                        logger.debug(f"Could not read audio with mutagen: {e}")
+                    finally:
+                        # Clean up temp file
+                        import os
+                        try:
+                            if tmp_path and os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                        except (OSError, PermissionError) as e:
+                            logger.debug(f"Could not delete temp file {tmp_path}: {e}")
+                except Exception as e:
+                    # Error writing temp file
+                    logger.debug(f"Error writing temp file: {e}")
             
             # Try to get ICY metadata (for Icecast/Shoutcast streams)
             icy_metadata = self._get_icy_metadata(url)
             if icy_metadata:
-                if icy_metadata.get("icy-br"):
-                    params["bitrate_kbps"] = int(icy_metadata["icy-br"])
-                if icy_metadata.get("icy-sr"):
-                    params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
+                try:
+                    if icy_metadata.get("icy-br"):
+                        params["bitrate_kbps"] = int(icy_metadata["icy-br"])
+                except (ValueError, TypeError):
+                    pass  # Invalid bitrate value, skip
+                try:
+                    if icy_metadata.get("icy-sr"):
+                        params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
+                except (ValueError, TypeError):
+                    pass  # Invalid sample rate value, skip
         
         except Exception as e:
             params["error"] = str(e)
+        finally:
+            # Ensure response is closed when using stream=True
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
         
         return params
     
@@ -313,63 +395,92 @@ class ConnectivityChecker:
                 metadata["description"] = icy_metadata.get("icy-description")
             
             # Try mutagen for file-based metadata
-            response = requests.get(
-                url,
-                timeout=(self.connection_timeout, self.read_timeout),
-                stream=True,
-                headers={"Range": "bytes=0-16384"},  # Get first 16KB
-                verify=self.verify_ssl
-            )
-            
-            if response.status_code in [200, 206]:
-                import tempfile
-                max_bytes = 16384  # Limit to 16KB
-                bytes_read = 0
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        tmp.write(chunk)
-                        bytes_read += len(chunk)
-                        if bytes_read >= max_bytes or len(chunk) < 8192:
-                            break
-                    tmp_path = tmp.name
+            response = None
+            try:
+                response = requests.get(
+                    url,
+                    timeout=(self.connection_timeout, self.read_timeout),
+                    stream=True,
+                    headers={"Range": "bytes=0-16384"},  # Get first 16KB
+                    verify=self.verify_ssl
+                )
                 
-                try:
-                    audio_file = mutagen.File(tmp_path)
-                    if audio_file:
-                        tags = audio_file.tags
-                        if tags:
-                            # Try common tag formats
-                            for key in ["TIT2", "TITLE", "\xa9nam"]:
-                                if key in tags:
-                                    metadata["title"] = str(tags[key][0]) if tags[key] else None
-                                    break
-                            
-                            for key in ["TPE1", "ARTIST", "\xa9ART"]:
-                                if key in tags:
-                                    metadata["artist"] = str(tags[key][0]) if tags[key] else None
-                                    break
-                            
-                            for key in ["TCON", "GENRE", "\xa9gen"]:
-                                if key in tags:
-                                    metadata["genre"] = str(tags[key][0]) if tags[key] else None
-                                    break
-                
-                except Exception:
-                    pass
-                finally:
-                    import os
+                if response.status_code in [200, 206]:
+                    import tempfile
+                    max_bytes = 16384  # Limit to 16KB
+                    bytes_read = 0
+                    tmp_path = None
                     try:
-                        os.unlink(tmp_path)
-                    except:
-                        pass
+                        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:  # Skip empty chunks
+                                    tmp.write(chunk)
+                                    bytes_read += len(chunk)
+                                    if bytes_read >= max_bytes or len(chunk) < 8192:
+                                        break
+                            tmp_path = tmp.name
+                        
+                        try:
+                            audio_file = mutagen.File(tmp_path)
+                            if audio_file:
+                                tags = audio_file.tags
+                                if tags:
+                                    # Try common tag formats
+                                    for key in ["TIT2", "TITLE", "\xa9nam"]:
+                                        if key in tags and tags[key]:
+                                            try:
+                                                metadata["title"] = str(tags[key][0]) if tags[key][0] else None
+                                                break
+                                            except (IndexError, TypeError):
+                                                continue
+                                    
+                                    for key in ["TPE1", "ARTIST", "\xa9ART"]:
+                                        if key in tags and tags[key]:
+                                            try:
+                                                metadata["artist"] = str(tags[key][0]) if tags[key][0] else None
+                                                break
+                                            except (IndexError, TypeError):
+                                                continue
+                                    
+                                    for key in ["TCON", "GENRE", "\xa9gen"]:
+                                        if key in tags and tags[key]:
+                                            try:
+                                                metadata["genre"] = str(tags[key][0]) if tags[key][0] else None
+                                                break
+                                            except (IndexError, TypeError):
+                                                continue
+                        
+                        except Exception as e:
+                            logger.debug(f"Error reading audio metadata: {e}")
+                        finally:
+                            import os
+                            try:
+                                if tmp_path and os.path.exists(tmp_path):
+                                    os.unlink(tmp_path)
+                            except (OSError, PermissionError) as e:
+                                logger.debug(f"Could not delete temp file {tmp_path}: {e}")
+                    except Exception as e:
+                        # Error writing temp file
+                        logger.debug(f"Error writing temp file: {e}")
+            except Exception as e:
+                # Error with requests.get
+                logger.debug(f"Error getting metadata file: {e}")
         
         except Exception as e:
             metadata["error"] = str(e)
+        finally:
+            # Ensure response is closed when using stream=True
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
         
         return metadata
     
     def _get_icy_metadata(self, url: str) -> Optional[Dict[str, str]]:
         """Get ICY metadata from Icecast/Shoutcast stream"""
+        response = None
         try:
             response = requests.get(
                 url,
@@ -381,14 +492,26 @@ class ConnectivityChecker:
             
             # Check for ICY headers
             icy_headers = {}
-            for key, value in response.headers.items():
-                if key.lower().startswith("icy-"):
-                    icy_headers[key.lower()] = value
+            if response and response.headers:
+                for key, value in response.headers.items():
+                    if key.lower().startswith("icy-"):
+                        icy_headers[key.lower()] = value
             
             return icy_headers if icy_headers else None
         
-        except Exception:
+        except (requests.RequestException, requests.Timeout, requests.ConnectionError) as e:
+            logger.debug(f"Error getting ICY metadata: {e}")
             return None
+        except Exception as e:
+            logger.warning(f"Unexpected error getting ICY metadata: {e}")
+            return None
+        finally:
+            # Ensure response is closed when using stream=True
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
     
     def _analyze_headers(self, url: str) -> Dict[str, Any]:
         """Analyze HTTP response headers"""
@@ -448,6 +571,9 @@ class ConnectivityChecker:
             if response.status_code == 200:
                 hls_info["playlist_accessible"] = True
                 content = response.text
+                if not content:
+                    hls_info["error"] = "Empty playlist content"
+                    return hls_info
                 
                 # Check if it's a master playlist (contains #EXT-X-STREAM-INF)
                 if "#EXT-X-STREAM-INF" in content:

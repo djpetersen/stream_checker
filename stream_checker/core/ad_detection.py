@@ -17,6 +17,10 @@ class AdDetector:
         monitoring_duration: int = 60,  # Monitor for 60 seconds
         check_interval: float = 2.0  # Check metadata every 2 seconds
     ):
+        if monitoring_duration <= 0:
+            raise ValueError("monitoring_duration must be positive")
+        if check_interval <= 0:
+            raise ValueError("check_interval must be positive")
         self.monitoring_duration = monitoring_duration
         self.check_interval = check_interval
         
@@ -102,8 +106,10 @@ class AdDetector:
                             
                             ad_break_start = None
                     
-                    last_title = current_title
-                    last_genre = current_genre
+                    # Only update last_title/last_genre when we have valid metadata
+                    if current_title or current_genre:
+                        last_title = current_title
+                        last_genre = current_genre
                 
                 # Wait before next check
                 time.sleep(self.check_interval)
@@ -122,14 +128,17 @@ class AdDetector:
                         "genre": last_genre or "Unknown"
                     })
         
-        except Exception as e:
+        except (requests.RequestException, KeyboardInterrupt) as e:
             logger.error(f"Error during ad detection: {e}")
+            result["error"] = str(e)
+        except Exception as e:
+            logger.error(f"Unexpected error during ad detection: {e}")
             result["error"] = str(e)
         
         # Calculate statistics
         result["ads_detected"] = len(ad_breaks) > 0
         result["ad_breaks"] = ad_breaks
-        result["total_ad_time_seconds"] = sum(ab["duration_seconds"] for ab in ad_breaks)
+        result["total_ad_time_seconds"] = sum(ab.get("duration_seconds", 0) for ab in ad_breaks)
         
         # Estimate frequency per hour (extrapolate from monitoring duration)
         if self.monitoring_duration > 0:
@@ -141,6 +150,7 @@ class AdDetector:
     
     def _get_stream_metadata(self, url: str) -> Optional[Dict[str, Any]]:
         """Get current stream metadata"""
+        response = None
         try:
             # Try ICY metadata (Icecast/Shoutcast)
             response = requests.get(
@@ -153,22 +163,33 @@ class AdDetector:
             metadata = {}
             
             # Check ICY headers
-            for key, value in response.headers.items():
-                if key.lower().startswith("icy-"):
-                    metadata_key = key.lower().replace("icy-", "")
-                    metadata[metadata_key] = value
+            if response and response.headers:
+                for key, value in response.headers.items():
+                    if key.lower().startswith("icy-"):
+                        metadata_key = key.lower().replace("icy-", "")
+                        metadata[metadata_key] = value
             
             # Try to get title from ICY metadata
-            if "icy-name" in metadata:
+            if "icy-name" in metadata and metadata["icy-name"]:
                 metadata["title"] = metadata["icy-name"]
-            if "icy-genre" in metadata:
+            if "icy-genre" in metadata and metadata["icy-genre"]:
                 metadata["genre"] = metadata["icy-genre"]
             
             return metadata if metadata else None
         
-        except Exception as e:
+        except requests.RequestException as e:
             logger.debug(f"Error getting metadata: {e}")
             return None
+        except Exception as e:
+            logger.warning(f"Unexpected error getting metadata: {e}")
+            return None
+        finally:
+            # Ensure response is closed when using stream=True
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
     
     def _is_ad_marker(self, title: str, genre: str) -> bool:
         """Check if metadata indicates an ad"""

@@ -7,7 +7,9 @@ Main CLI entry point
 import sys
 import argparse
 import json
+import logging
 from pathlib import Path
+from typing import Any
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -40,7 +42,7 @@ def print_section(title: str):
     print("-" * 60)
 
 
-def print_result(key: str, value: any, status: str = None):
+def print_result(key: str, value: Any, status: str = None):
     """Print key-value result with optional status color"""
     if status == "success":
         status_marker = f"{Fore.GREEN}✓{Style.RESET_ALL}"
@@ -59,7 +61,13 @@ def print_result(key: str, value: any, status: str = None):
 
 def format_json_output(result: dict) -> str:
     """Format result as JSON"""
-    return json.dumps(result, indent=2)
+    try:
+        return json.dumps(result, indent=2, default=str)  # default=str handles non-serializable types
+    except (TypeError, ValueError) as e:
+        logger = logging.getLogger("stream_checker")
+        logger.error(f"JSON serialization error: {e}")
+        # Return a simplified error message
+        return json.dumps({"error": "Failed to serialize results", "details": str(e)}, indent=2)
 
 
 def format_text_output(result: dict) -> str:
@@ -397,6 +405,25 @@ Examples:
         print(f"{Fore.RED}Error: Invalid phase. Must be 1-4.{Style.RESET_ALL}", file=sys.stderr)
         sys.exit(1)
     
+    # Validate silence threshold
+    if args.silence_threshold is not None and not validate_silence_threshold(args.silence_threshold):
+        print(f"{Fore.RED}Error: Invalid silence threshold. Must be between -100 and 0 dB.{Style.RESET_ALL}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Validate sample duration
+    if args.sample_duration is not None and not validate_sample_duration(args.sample_duration):
+        print(f"{Fore.RED}Error: Invalid sample duration. Must be between 1 and 300 seconds.{Style.RESET_ALL}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Validate test_run_id format if provided
+    if args.test_run_id:
+        try:
+            import uuid
+            uuid.UUID(args.test_run_id)  # Validate UUID format
+        except ValueError:
+            print(f"{Fore.RED}Error: Invalid test_run_id format. Must be a valid UUID.{Style.RESET_ALL}", file=sys.stderr)
+            sys.exit(1)
+    
     # Generate IDs
     test_run_id = args.test_run_id or generate_test_run_id()
     stream_id = generate_stream_id(args.url)
@@ -405,11 +432,16 @@ Examples:
     logger.info(f"Stream ID: {stream_id}")
     
     # Initialize database
-    db_path = config.get_path("database.path")
-    db = Database(db_path)
-    
-    # Add stream to database
-    db.add_stream(stream_id, args.url)
+    try:
+        db_path = config.get_path("database.path")
+        db = Database(db_path)
+        
+        # Add stream to database
+        db.add_stream(stream_id, args.url)
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        print(f"{Fore.YELLOW}Warning: Database operations may fail. Continuing without database.{Style.RESET_ALL}", file=sys.stderr)
+        db = None
     
     # Determine which phases to run
     # If no phase specified, run all phases (1-4)
@@ -444,8 +476,12 @@ Examples:
         result.update(phase_result)
         
         # Save to database
-        db.add_test_run(test_run_id, stream_id, 1, result)
-        db.update_stream_test_count(stream_id)
+        if db:
+            try:
+                db.add_test_run(test_run_id, stream_id, 1, result)
+                db.update_stream_test_count(stream_id)
+            except Exception as e:
+                logger.error(f"Failed to save Phase 1 results to database: {e}")
         
         logger.info("Phase 1 completed")
     
@@ -476,7 +512,11 @@ Examples:
         result["phase"] = 2
         
         # Save to database
-        db.add_test_run(test_run_id, stream_id, 2, result)
+        if db:
+            try:
+                db.add_test_run(test_run_id, stream_id, 2, result)
+            except Exception as e:
+                logger.error(f"Failed to save Phase 2 results to database: {e}")
         
         logger.info("Phase 2 completed")
     
@@ -502,7 +542,11 @@ Examples:
         result["phase"] = 3
         
         # Save to database
-        db.add_test_run(test_run_id, stream_id, 3, result)
+        if db:
+            try:
+                db.add_test_run(test_run_id, stream_id, 3, result)
+            except Exception as e:
+                logger.error(f"Failed to save Phase 3 results to database: {e}")
         
         logger.info("Phase 3 completed")
     
@@ -533,7 +577,11 @@ Examples:
         result["phase"] = 4
         
         # Save to database
-        db.add_test_run(test_run_id, stream_id, 4, result)
+        if db:
+            try:
+                db.add_test_run(test_run_id, stream_id, 4, result)
+            except Exception as e:
+                logger.error(f"Failed to save Phase 4 results to database: {e}")
         
         logger.info("Phase 4 completed")
     
