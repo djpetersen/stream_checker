@@ -322,3 +322,4 @@ If audio analysis fails:
 - [ ] Future: AWS Cloud Deployment
 
 See `SPEC.md` for detailed specification.
+See `AWS_DEPLOYMENT_GUIDE.md` for AWS deployment steps and difficulty levels.
