@@ -1,0 +1,36 @@
+# Stream Checker Configuration
+
+database:
+  path: "~/.stream_checker/stream_checker.db"
+  backup_enabled: true
+  backup_retention_days: 30
+
+storage:
+  results_dir: "~/.stream_checker/results"
+  temp_dir: "/tmp/stream_checker"
+  cleanup_after_test: true
+  max_temp_file_size_mb: 100
+
+security:
+  allowed_schemes: ["http", "https"]
+  block_private_ips: false  # Allow local testing
+  connection_timeout: 30
+  read_timeout: 60
+  max_url_length: 2048
+  max_urls_per_minute: 10
+
+resource_limits:
+  max_cpu_time_seconds: 300
+  max_memory_mb: 512
+  max_temp_file_size_mb: 100
+
+logging:
+  level: "INFO"
+  file: "~/.stream_checker/logs/stream_checker.log"
+  max_file_size_mb: 10
+  backup_count: 5
+
+stream_checker:
+  default_phase: 4
+  default_silence_threshold: -40
+  default_sample_duration: 10

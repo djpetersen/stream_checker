@@ -1,0 +1,26 @@
+# Core dependencies
+requests>=2.31.0
+httpx>=0.25.0
+mutagen>=1.47.0
+eyed3>=0.9.7
+ffmpeg-python>=0.2.0
+pydub>=0.25.1
+numpy>=1.24.0
+python-vlc>=3.0.20123
+
+# Security
+cryptography>=41.0.0
+bcrypt>=4.0.1
+python-dotenv>=1.0.0
+
+# Database
+# SQLite is built-in to Python, no external dependency needed
+
+# Utilities
+pyyaml>=6.0.1
+colorama>=0.4.6  # For colored terminal output
+
+# Development dependencies (optional)
+# bandit>=1.7.5
+# safety>=2.3.5
+# pip-audit>=2.6.1
