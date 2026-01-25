@@ -2,8 +2,11 @@
 
 import os
 import yaml
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
+
+logger = logging.getLogger("stream_checker")
 
 
 def expand_path(path: str) -> str:
@@ -38,8 +41,6 @@ class Config:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     self._config = yaml.safe_load(f) or {}
             except (yaml.YAMLError, IOError, OSError) as e:
-                import logging
-                logger = logging.getLogger("stream_checker")
                 logger.warning(f"Error loading config file {self.config_path}: {e}. Using defaults.")
                 self._config = self._get_defaults()
         else:

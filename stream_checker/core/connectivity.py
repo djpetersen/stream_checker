@@ -1,9 +1,11 @@
 """Phase 1: Stream connectivity and metadata extraction"""
 
+import os
 import time
 import ssl
 import socket
 import logging
+import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
@@ -241,7 +243,6 @@ class ConnectivityChecker:
             
             if response.status_code in [200, 206]:  # 206 is Partial Content
                 # Save to temporary file for mutagen
-                import tempfile
                 max_bytes = 16384  # Limit to 16KB
                 bytes_read = 0
                 tmp_path = None
@@ -340,7 +341,6 @@ class ConnectivityChecker:
                         logger.debug(f"Could not read audio with mutagen: {e}")
                     finally:
                         # Clean up temp file
-                        import os
                         try:
                             if tmp_path and os.path.exists(tmp_path):
                                 os.unlink(tmp_path)
@@ -406,7 +406,6 @@ class ConnectivityChecker:
                 )
                 
                 if response.status_code in [200, 206]:
-                    import tempfile
                     max_bytes = 16384  # Limit to 16KB
                     bytes_read = 0
                     tmp_path = None
@@ -453,7 +452,6 @@ class ConnectivityChecker:
                         except Exception as e:
                             logger.debug(f"Error reading audio metadata: {e}")
                         finally:
-                            import os
                             try:
                                 if tmp_path and os.path.exists(tmp_path):
                                     os.unlink(tmp_path)
@@ -523,6 +521,7 @@ class ConnectivityChecker:
             "content_type": None
         }
         
+        response = None
         try:
             response = requests.head(
                 url,
@@ -545,6 +544,13 @@ class ConnectivityChecker:
         
         except Exception as e:
             headers_info["error"] = str(e)
+        finally:
+            # Ensure response is closed
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
         
         return headers_info
     
@@ -561,6 +567,7 @@ class ConnectivityChecker:
             "variant_streams": []
         }
         
+        response = None
         try:
             response = requests.get(
                 url,
@@ -596,5 +603,12 @@ class ConnectivityChecker:
         
         except Exception as e:
             hls_info["error"] = str(e)
+        finally:
+            # Ensure response is closed
+            if response:
+                try:
+                    response.close()
+                except Exception:
+                    pass
         
         return hls_info
