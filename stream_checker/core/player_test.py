@@ -379,22 +379,31 @@ class PlayerTesterFallback:
                 if platform.system() == "Darwin":
                     from stream_checker.core.audio_analysis import _run_subprocess_worker
                     import queue as queue_module
-                    mp_queue = multiprocessing.Queue()
-                    process_obj = multiprocessing.Process(
-                        target=_run_subprocess_worker,
-                        args=(mp_queue, ["which", "vlc"], 2)
-                    )
-                    process_obj.start()
-                    process_obj.join(timeout=5)
-                    if process_obj.is_alive():
-                        process_obj.terminate()
-                        process_obj.join()
-                    if not mp_queue.empty():
-                        result = mp_queue.get()
-                        if result.get('success') and result.get('returncode') == 0:
-                            vlc_path = result.get('stdout').decode().strip() if result.get('stdout') else None
-                            if vlc_path:
-                                paths.insert(0, vlc_path)
+                    mp_queue = None
+                    process_obj = None
+                    try:
+                        mp_queue = multiprocessing.Queue()
+                        process_obj = multiprocessing.Process(
+                            target=_run_subprocess_worker,
+                            args=(mp_queue, ["which", "vlc"], 2)
+                        )
+                        process_obj.start()
+                        process_obj.join(timeout=5)
+                        
+                        # Check if process timed out
+                        if process_obj.is_alive():
+                            # Process timed out - will be cleaned up in finally block
+                            pass
+                        elif not mp_queue.empty():
+                            result = mp_queue.get()
+                            if result.get('success') and result.get('returncode') == 0:
+                                vlc_path = result.get('stdout').decode().strip() if result.get('stdout') else None
+                                if vlc_path:
+                                    paths.insert(0, vlc_path)
+                    finally:
+                        # Clean up resources - CRITICAL to prevent semaphore leaks
+                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command.which", timeout=2.0)
+                        cleanup_multiprocessing_queue(mp_queue, context="_find_vlc_command.which")
                 else:
                     which_result = subprocess.run(["which", "vlc"], capture_output=True, timeout=2)
                     if which_result.returncode == 0:
@@ -430,20 +439,21 @@ class PlayerTesterFallback:
                         )
                         process_obj.start()
                         process_obj.join(timeout=7)
+                        
+                        # Check if process timed out
                         if process_obj.is_alive():
-                            process_obj.terminate()
-                            process_obj.join(timeout=2)
-                            if process_obj.is_alive():
-                                process_obj.kill()
-                                process_obj.join()
+                            # Process timed out - will be cleaned up in finally block
                             continue
+                        
+                        # Get result from queue if available
                         if not mp_queue.empty():
                             result = mp_queue.get()
                             if result.get('success') and result.get('returncode') == 0:
                                 return path
                     finally:
                         # Clean up resources - CRITICAL to prevent semaphore leaks
-                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command")
+                        # This handles both normal completion and timeout cases
+                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command", timeout=2.0)
                         cleanup_multiprocessing_queue(mp_queue, context="_find_vlc_command")
                 else:
                     result = subprocess.run(
@@ -508,23 +518,22 @@ class PlayerTesterFallback:
                     process_obj.start()
                     process_obj.join(timeout=total_timeout + 10)
                     
+                    # Check if process timed out
                     if process_obj.is_alive():
-                        process_obj.terminate()
-                        process_obj.join(timeout=2)
-                        if process_obj.is_alive():
-                            process_obj.kill()
-                            process_obj.join()
+                        # Process timed out - will be cleaned up in finally block
                         result["status"] = "error"
                         result["errors"].append("VLC process timeout")
                         return result
                     
-                    if mp_queue.empty():
+                    # Get result from queue if available
+                    if not mp_queue.empty():
+                        vlc_result = mp_queue.get()
+                        return_code = vlc_result.get('returncode')
+                    else:
+                        # Queue is empty - process may have crashed
                         result["status"] = "error"
                         result["errors"].append("VLC process result queue is empty")
                         return result
-                    
-                    vlc_result = mp_queue.get()
-                    return_code = vlc_result.get('returncode')
                     stdout = vlc_result.get('stdout')
                     stderr = vlc_result.get('stderr')
                     elapsed_time = vlc_result.get('elapsed_time', 0)
@@ -548,7 +557,8 @@ class PlayerTesterFallback:
                                 result["error_details"] = error_text[:500]  # Limit error text
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    cleanup_multiprocessing_process(process_obj, context="PlayerTesterFallback.check")
+                    # This handles both normal completion and timeout cases
+                    cleanup_multiprocessing_process(process_obj, context="PlayerTesterFallback.check", timeout=2.0)
                     cleanup_multiprocessing_queue(mp_queue, context="PlayerTesterFallback.check")
             else:
                 # On other platforms, subprocess is safe

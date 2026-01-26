@@ -209,20 +209,21 @@ class AudioAnalyzer:
                         )
                         process_obj.start()
                         process_obj.join(timeout=5)
+                        
+                        # Check if process timed out
                         if process_obj.is_alive():
-                            process_obj.terminate()
-                            process_obj.join(timeout=2)
-                            if process_obj.is_alive():
-                                process_obj.kill()
-                                process_obj.join()
+                            # Process timed out - will be cleaned up in finally block
                             continue
+                        
+                        # Get result from queue if available
                         if not queue.empty():
                             result = queue.get()
                             if result.get('success') and result.get('returncode') == 0:
                                 return path
                     finally:
                         # Clean up resources - CRITICAL to prevent semaphore leaks
-                        cleanup_multiprocessing_process(process_obj, context="_find_ffmpeg")
+                        # This handles both normal completion and timeout cases
+                        cleanup_multiprocessing_process(process_obj, context="_find_ffmpeg", timeout=2.0)
                         cleanup_multiprocessing_queue(queue, context="_find_ffmpeg")
                 else:
                     # On other platforms, subprocess is safe
@@ -274,23 +275,24 @@ class AudioAnalyzer:
                     )
                     process_obj.start()
                     process_obj.join(timeout=timeout + 5)
+                    
+                    # Check if process timed out
                     if process_obj.is_alive():
-                        process_obj.terminate()
-                        process_obj.join(timeout=2)
-                        if process_obj.is_alive():
-                            process_obj.kill()
-                            process_obj.join()
+                        # Process timed out - will be cleaned up in finally block
                         raise subprocess.TimeoutExpired(cmd, timeout)
                     
-                    if queue.empty():
+                    # Get result from queue if available
+                    if not queue.empty():
+                        result = queue.get()
+                        process_returncode = result.get('returncode')
+                        process_stderr = result.get('stderr')
+                    else:
+                        # Queue is empty - process may have crashed
                         raise Exception("Subprocess result queue is empty")
-                    
-                    result = queue.get()
-                    process_returncode = result.get('returncode')
-                    process_stderr = result.get('stderr')
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    cleanup_multiprocessing_process(process_obj, context="_download_audio_sample")
+                    # This handles both normal completion and timeout cases
+                    cleanup_multiprocessing_process(process_obj, context="_download_audio_sample", timeout=2.0)
                     cleanup_multiprocessing_queue(queue, context="_download_audio_sample")
             else:
                 # On other platforms, subprocess is safe
@@ -359,26 +361,27 @@ class AudioAnalyzer:
                     )
                     process_obj.start()
                     process_obj.join(timeout=35)
+                    
+                    # Check if process timed out
                     if process_obj.is_alive():
-                        process_obj.terminate()
-                        process_obj.join(timeout=2)
-                        if process_obj.is_alive():
-                            process_obj.kill()
-                            process_obj.join()
+                        # Process timed out - will be cleaned up in finally block
                         logger.error("ffmpeg conversion timeout")
                         return None, 0, 0
                     
-                    if queue.empty():
+                    # Get result from queue if available
+                    if not queue.empty():
+                        result = queue.get()
+                        process_returncode = result.get('returncode')
+                        process_stdout = result.get('stdout')
+                        process_stderr = result.get('stderr')
+                    else:
+                        # Queue is empty - process may have crashed
                         logger.error("Subprocess result queue is empty")
                         return None, 0, 0
-                    
-                    result = queue.get()
-                    process_returncode = result.get('returncode')
-                    process_stdout = result.get('stdout')
-                    process_stderr = result.get('stderr')
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    cleanup_multiprocessing_process(process_obj, context="_load_audio_raw")
+                    # This handles both normal completion and timeout cases
+                    cleanup_multiprocessing_process(process_obj, context="_load_audio_raw", timeout=2.0)
                     cleanup_multiprocessing_queue(queue, context="_load_audio_raw")
             else:
                 # On other platforms, subprocess is safe
