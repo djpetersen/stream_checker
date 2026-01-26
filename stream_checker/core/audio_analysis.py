@@ -11,15 +11,44 @@ import logging
 logger = logging.getLogger("stream_checker")
 
 # Use spawn method on macOS to avoid fork issues
-# This must be set before any multiprocessing operations
-if hasattr(multiprocessing, 'get_start_method'):
-    try:
-        current_method = multiprocessing.get_start_method()
-        if current_method != 'spawn':
-            multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # Already set or can't change
-        pass
+# Defer setting until actually needed to avoid conflicts in Flask/multi-threaded environments
+_mp_start_method_set = False
+
+def _ensure_spawn_method():
+    """Ensure multiprocessing uses spawn method on macOS - call only when needed"""
+    global _mp_start_method_set
+    if _mp_start_method_set:
+        return
+    
+    if hasattr(multiprocessing, 'get_start_method'):
+        try:
+            import platform
+            if platform.system() != "Darwin":
+                _mp_start_method_set = True
+                return
+            
+            current_method = multiprocessing.get_start_method(allow_none=True)
+            if current_method is None:
+                # Not set yet, set it to spawn on macOS
+                try:
+                    multiprocessing.set_start_method('spawn')
+                    _mp_start_method_set = True
+                except RuntimeError:
+                    # Can't set - might already be set in another process
+                    pass
+            elif current_method == 'spawn':
+                _mp_start_method_set = True
+            else:
+                # Try to change it, but don't force (may fail in some contexts)
+                try:
+                    multiprocessing.set_start_method('spawn', force=True)
+                    _mp_start_method_set = True
+                except RuntimeError:
+                    # Already set or can't change - this is OK
+                    pass
+        except RuntimeError:
+            # Already set or can't change - this is OK
+            pass
 
 
 def _run_subprocess_safe(cmd, timeout, stdout, stderr):
@@ -60,8 +89,19 @@ def _run_subprocess_safe(cmd, timeout, stdout, stderr):
 
 def _run_subprocess_worker(queue, cmd, timeout):
     """Worker function for multiprocessing - must be at module level for pickling"""
-    result = _run_subprocess_safe(cmd, timeout, subprocess.PIPE, subprocess.PIPE)
-    queue.put(result)
+    try:
+        result = _run_subprocess_safe(cmd, timeout, subprocess.PIPE, subprocess.PIPE)
+        queue.put(result)
+    except Exception as e:
+        # Put error result in queue so caller knows something went wrong
+        queue.put({
+            'success': False,
+            'returncode': None,
+            'stdout': None,
+            'stderr': None,
+            'error': str(e)
+        })
+    # Note: Don't close queue here - it's managed by the caller
 
 
 class AudioAnalyzer:
@@ -156,21 +196,64 @@ class AudioAnalyzer:
                 import platform
                 if platform.system() == "Darwin":
                     # On macOS, use multiprocessing with spawn
-                    queue = multiprocessing.Queue()
-                    process = multiprocessing.Process(
-                        target=_run_subprocess_worker,
-                        args=(queue, [path, "-version"], 2)
-                    )
-                    process.start()
-                    process.join(timeout=5)
-                    if process.is_alive():
-                        process.terminate()
-                        process.join()
-                        continue
-                    if not queue.empty():
-                        result = queue.get()
-                        if result.get('success') and result.get('returncode') == 0:
-                            return path
+                    _ensure_spawn_method()  # Ensure spawn method is set before creating queue
+                    queue = None
+                    process_obj = None
+                    try:
+                        queue = multiprocessing.Queue()
+                        process_obj = multiprocessing.Process(
+                            target=_run_subprocess_worker,
+                            args=(queue, [path, "-version"], 2)
+                        )
+                        process_obj.start()
+                        process_obj.join(timeout=5)
+                        if process_obj.is_alive():
+                            process_obj.terminate()
+                            process_obj.join(timeout=2)
+                            if process_obj.is_alive():
+                                process_obj.kill()
+                                process_obj.join()
+                            continue
+                        if not queue.empty():
+                            result = queue.get()
+                            if result.get('success') and result.get('returncode') == 0:
+                                return path
+                    finally:
+                        # Clean up resources - CRITICAL to prevent semaphore leaks
+                        try:
+                            if process_obj and process_obj.is_alive():
+                                process_obj.terminate()
+                                process_obj.join(timeout=1)
+                                if process_obj.is_alive():
+                                    process_obj.kill()
+                                    process_obj.join()
+                        except Exception:
+                            pass
+                        try:
+                            if queue is not None:
+                                # CRITICAL: Properly drain and close queue to prevent semaphore leaks
+                                try:
+                                    # Get any remaining items (with timeout to avoid blocking)
+                                    import queue as queue_module
+                                    while True:
+                                        try:
+                                            queue.get(timeout=0.1)
+                                        except queue_module.Empty:
+                                            break
+                                        except Exception:
+                                            break
+                                except Exception:
+                                    pass
+                                try:
+                                    queue.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    queue.join_thread(timeout=2)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                 else:
                     # On other platforms, subprocess is safe
                     result = subprocess.run([path, "-version"], capture_output=True, timeout=2)
@@ -211,24 +294,66 @@ class AudioAnalyzer:
             import platform
             if platform.system() == "Darwin":
                 # On macOS, use multiprocessing with spawn to avoid fork crash
+                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
                 queue = multiprocessing.Queue()
-                process_obj = multiprocessing.Process(
-                    target=_run_subprocess_worker,
-                    args=(queue, cmd, timeout)
-                )
-                process_obj.start()
-                process_obj.join(timeout=timeout + 5)
-                if process_obj.is_alive():
-                    process_obj.terminate()
-                    process_obj.join()
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-                
-                if queue.empty():
-                    raise Exception("Subprocess result queue is empty")
-                
-                result = queue.get()
-                process_returncode = result.get('returncode')
-                process_stderr = result.get('stderr')
+                process_obj = None
+                try:
+                    process_obj = multiprocessing.Process(
+                        target=_run_subprocess_worker,
+                        args=(queue, cmd, timeout)
+                    )
+                    process_obj.start()
+                    process_obj.join(timeout=timeout + 5)
+                    if process_obj.is_alive():
+                        process_obj.terminate()
+                        process_obj.join(timeout=2)
+                        if process_obj.is_alive():
+                            process_obj.kill()
+                            process_obj.join()
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    
+                    if queue.empty():
+                        raise Exception("Subprocess result queue is empty")
+                    
+                    result = queue.get()
+                    process_returncode = result.get('returncode')
+                    process_stderr = result.get('stderr')
+                finally:
+                    # Clean up resources - CRITICAL to prevent semaphore leaks
+                    try:
+                        if process_obj and process_obj.is_alive():
+                            process_obj.terminate()
+                            process_obj.join(timeout=1)
+                            if process_obj.is_alive():
+                                process_obj.kill()
+                                process_obj.join()
+                    except Exception:
+                        pass
+                    try:
+                        if queue is not None:
+                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
+                            try:
+                                # Get any remaining items (with timeout to avoid blocking)
+                                import queue as queue_module
+                                while True:
+                                    try:
+                                        queue.get(timeout=0.1)
+                                    except queue_module.Empty:
+                                        break
+                                    except Exception:
+                                        break
+                            except Exception:
+                                pass
+                            try:
+                                queue.close()
+                            except Exception:
+                                pass
+                            try:
+                                queue.join_thread(timeout=2)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(
@@ -300,27 +425,70 @@ class AudioAnalyzer:
             import platform
             if platform.system() == "Darwin":
                 # On macOS, use multiprocessing with spawn
-                queue = multiprocessing.Queue()
-                process_obj = multiprocessing.Process(
-                    target=_run_subprocess_worker,
-                    args=(queue, cmd, 30)
-                )
-                process_obj.start()
-                process_obj.join(timeout=35)
-                if process_obj.is_alive():
-                    process_obj.terminate()
-                    process_obj.join()
-                    logger.error("ffmpeg conversion timeout")
-                    return None, 0, 0
-                
-                if queue.empty():
-                    logger.error("Subprocess result queue is empty")
-                    return None, 0, 0
-                
-                result = queue.get()
-                process_returncode = result.get('returncode')
-                process_stdout = result.get('stdout')
-                process_stderr = result.get('stderr')
+                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
+                queue = None
+                process_obj = None
+                try:
+                    queue = multiprocessing.Queue()
+                    process_obj = multiprocessing.Process(
+                        target=_run_subprocess_worker,
+                        args=(queue, cmd, 30)
+                    )
+                    process_obj.start()
+                    process_obj.join(timeout=35)
+                    if process_obj.is_alive():
+                        process_obj.terminate()
+                        process_obj.join(timeout=2)
+                        if process_obj.is_alive():
+                            process_obj.kill()
+                            process_obj.join()
+                        logger.error("ffmpeg conversion timeout")
+                        return None, 0, 0
+                    
+                    if queue.empty():
+                        logger.error("Subprocess result queue is empty")
+                        return None, 0, 0
+                    
+                    result = queue.get()
+                    process_returncode = result.get('returncode')
+                    process_stdout = result.get('stdout')
+                    process_stderr = result.get('stderr')
+                finally:
+                    # Clean up resources - CRITICAL to prevent semaphore leaks
+                    try:
+                        if process_obj and process_obj.is_alive():
+                            process_obj.terminate()
+                            process_obj.join(timeout=1)
+                            if process_obj.is_alive():
+                                process_obj.kill()
+                                process_obj.join()
+                    except Exception:
+                        pass
+                    try:
+                        if queue is not None:
+                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
+                            try:
+                                # Get any remaining items (with timeout to avoid blocking)
+                                import queue as queue_module
+                                while True:
+                                    try:
+                                        queue.get(timeout=0.1)
+                                    except queue_module.Empty:
+                                        break
+                                    except Exception:
+                                        break
+                            except Exception:
+                                pass
+                            try:
+                                queue.close()
+                            except Exception:
+                                pass
+                            try:
+                                queue.join_thread(timeout=2)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(

@@ -10,15 +10,43 @@ from typing import Dict, Any, Optional
 import logging
 
 # Use spawn method on macOS to avoid fork issues
-# This must be set before any multiprocessing operations
-if hasattr(multiprocessing, 'get_start_method'):
-    try:
-        current_method = multiprocessing.get_start_method()
-        if current_method != 'spawn':
-            multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # Already set or can't change
-        pass
+# Defer setting until actually needed to avoid conflicts in Flask/multi-threaded environments
+_mp_start_method_set = False
+
+def _ensure_spawn_method():
+    """Ensure multiprocessing uses spawn method on macOS - call only when needed"""
+    global _mp_start_method_set
+    if _mp_start_method_set:
+        return
+    
+    if hasattr(multiprocessing, 'get_start_method'):
+        try:
+            if platform.system() != "Darwin":
+                _mp_start_method_set = True
+                return
+            
+            current_method = multiprocessing.get_start_method(allow_none=True)
+            if current_method is None:
+                # Not set yet, set it to spawn on macOS
+                try:
+                    multiprocessing.set_start_method('spawn')
+                    _mp_start_method_set = True
+                except RuntimeError:
+                    # Can't set - might already be set in another process
+                    pass
+            elif current_method == 'spawn':
+                _mp_start_method_set = True
+            else:
+                # Try to change it, but don't force (may fail in some contexts)
+                try:
+                    multiprocessing.set_start_method('spawn', force=True)
+                    _mp_start_method_set = True
+                except RuntimeError:
+                    # Already set or can't change - this is OK
+                    pass
+        except RuntimeError:
+            # Already set or can't change - this is OK
+            pass
 
 logger = logging.getLogger("stream_checker")
 
@@ -29,6 +57,83 @@ try:
 except (ImportError, OSError) as e:
     VLC_AVAILABLE = False
     logger.debug(f"python-vlc not available: {e}")
+
+
+def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
+    """Worker function for VLC subprocess - runs in separate process to avoid fork crash"""
+    import time
+    process = None
+    try:
+        process = subprocess.Popen(
+            cmd + [url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL
+        )
+        
+        start_time = time.time()
+        
+        # Wait for process with timeout
+        try:
+            stdout, stderr = process.communicate(timeout=total_timeout)
+            return_code = process.returncode
+            elapsed_time = time.time() - start_time
+            queue.put({
+                'success': True,
+                'returncode': return_code,
+                'stdout': stdout,
+                'stderr': stderr,
+                'elapsed_time': elapsed_time
+            })
+        except subprocess.TimeoutExpired:
+            # Try graceful termination first
+            try:
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=5)
+                return_code = process.returncode
+                elapsed_time = time.time() - start_time
+                queue.put({
+                    'success': True,
+                    'returncode': return_code,
+                    'stdout': stdout,
+                    'stderr': stderr,
+                    'timeout': True,
+                    'elapsed_time': elapsed_time
+                })
+            except subprocess.TimeoutExpired:
+                # Force kill if terminate didn't work
+                process.kill()
+                process.wait()
+                elapsed_time = time.time() - start_time
+                queue.put({
+                    'success': False,
+                    'returncode': None,
+                    'stdout': None,
+                    'stderr': None,
+                    'error': 'timeout',
+                    'elapsed_time': elapsed_time
+                })
+    except Exception as e:
+        elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
+        queue.put({
+            'success': False,
+            'returncode': None,
+            'stdout': None,
+            'stderr': None,
+            'error': str(e),
+            'elapsed_time': elapsed_time
+        })
+    finally:
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait()
+                except Exception:
+                    pass
 
 
 class PlayerTester:
@@ -307,22 +412,65 @@ class PlayerTesterFallback:
             try:
                 if system == "Darwin":
                     # On macOS, use multiprocessing to avoid fork crash
+                    _ensure_spawn_method()  # Ensure spawn method is set before creating queue
                     from stream_checker.core.audio_analysis import _run_subprocess_worker
-                    mp_queue = multiprocessing.Queue()
-                    process_obj = multiprocessing.Process(
-                        target=_run_subprocess_worker,
-                        args=(mp_queue, [path, "--version"], 5)
-                    )
-                    process_obj.start()
-                    process_obj.join(timeout=7)
-                    if process_obj.is_alive():
-                        process_obj.terminate()
-                        process_obj.join()
-                        continue
-                    if not mp_queue.empty():
-                        result = mp_queue.get()
-                        if result.get('success') and result.get('returncode') == 0:
-                            return path
+                    mp_queue = None
+                    process_obj = None
+                    try:
+                        mp_queue = multiprocessing.Queue()
+                        process_obj = multiprocessing.Process(
+                            target=_run_subprocess_worker,
+                            args=(mp_queue, [path, "--version"], 5)
+                        )
+                        process_obj.start()
+                        process_obj.join(timeout=7)
+                        if process_obj.is_alive():
+                            process_obj.terminate()
+                            process_obj.join(timeout=2)
+                            if process_obj.is_alive():
+                                process_obj.kill()
+                                process_obj.join()
+                            continue
+                        if not mp_queue.empty():
+                            result = mp_queue.get()
+                            if result.get('success') and result.get('returncode') == 0:
+                                return path
+                    finally:
+                        # Clean up resources - CRITICAL to prevent semaphore leaks
+                        try:
+                            if process_obj and process_obj.is_alive():
+                                process_obj.terminate()
+                                process_obj.join(timeout=1)
+                                if process_obj.is_alive():
+                                    process_obj.kill()
+                                    process_obj.join()
+                        except Exception:
+                            pass
+                        try:
+                            if mp_queue is not None:
+                                # CRITICAL: Properly drain and close queue to prevent semaphore leaks
+                                try:
+                                    # Get any remaining items (with timeout to avoid blocking)
+                                    import queue as queue_module
+                                    while True:
+                                        try:
+                                            mp_queue.get(timeout=0.1)
+                                        except queue_module.Empty:
+                                            break
+                                        except Exception:
+                                            break
+                                except Exception:
+                                    pass
+                                try:
+                                    mp_queue.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    mp_queue.join_thread(timeout=2)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                 else:
                     result = subprocess.run(
                         [path, "--version"],
@@ -364,25 +512,104 @@ class PlayerTesterFallback:
             # On macOS, use multiprocessing to avoid fork crash
             # On other platforms, subprocess is safe
             if platform.system() == "Darwin":
-                # For macOS, we'll use a simpler approach: just skip VLC testing
-                # or use a subprocess with spawn (which is safer but more complex)
-                # For now, let's use subprocess but with extra safety
-                process = subprocess.Popen(
-                    [
-                        vlc_cmd,
-                        "--intf", "dummy",
-                        "--quiet",
-                        "--no-video",
-                        "--run-time", str(self.playback_duration),
-                        "--network-caching=3000",
-                        url
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True
-                )
+                # Use multiprocessing for VLC on macOS
+                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
+                vlc_cmd_list = [
+                    vlc_cmd,
+                    "--intf", "dummy",
+                    "--quiet",
+                    "--no-video",
+                    "--run-time", str(self.playback_duration),
+                    "--network-caching=3000"
+                ]
+                
+                mp_queue = None
+                process_obj = None
+                try:
+                    mp_queue = multiprocessing.Queue()
+                    process_obj = multiprocessing.Process(
+                        target=_run_vlc_worker,
+                        args=(mp_queue, vlc_cmd_list, url, self.playback_duration, total_timeout)
+                    )
+                    process_obj.start()
+                    process_obj.join(timeout=total_timeout + 10)
+                    
+                    if process_obj.is_alive():
+                        process_obj.terminate()
+                        process_obj.join(timeout=2)
+                        if process_obj.is_alive():
+                            process_obj.kill()
+                            process_obj.join()
+                        result["status"] = "error"
+                        result["errors"].append("VLC process timeout")
+                        return result
+                    
+                    if mp_queue.empty():
+                        result["status"] = "error"
+                        result["errors"].append("VLC process result queue is empty")
+                        return result
+                    
+                    vlc_result = mp_queue.get()
+                    return_code = vlc_result.get('returncode')
+                    stdout = vlc_result.get('stdout')
+                    stderr = vlc_result.get('stderr')
+                    elapsed_time = vlc_result.get('elapsed_time', 0)
+                    
+                    result["playback_duration_seconds"] = round(elapsed_time, 2)
+                    
+                    # Check return code
+                    if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
+                        result["status"] = "success"
+                        result["format_supported"] = True
+                        # Estimate connection time (first 20% of total time, max 5 seconds)
+                        connection_time = min(elapsed_time * 0.2, 5.0)
+                        result["connection_time_ms"] = int(connection_time * 1000)
+                    else:
+                        result["status"] = "error"
+                        if return_code != -15:  # Don't add error for SIGTERM
+                            result["errors"].append(f"VLC returned error code {return_code}")
+                        if stderr:
+                            error_text = stderr.decode('utf-8', errors='ignore')
+                            if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
+                                result["error_details"] = error_text[:500]  # Limit error text
+                finally:
+                    # Clean up resources - CRITICAL to prevent semaphore leaks
+                    try:
+                        if process_obj and process_obj.is_alive():
+                            process_obj.terminate()
+                            process_obj.join(timeout=1)
+                            if process_obj.is_alive():
+                                process_obj.kill()
+                                process_obj.join()
+                    except Exception:
+                        pass
+                    try:
+                        if mp_queue is not None:
+                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
+                            try:
+                                # Get any remaining items (with timeout to avoid blocking)
+                                import queue as queue_module
+                                while True:
+                                    try:
+                                        mp_queue.get(timeout=0.1)
+                                    except queue_module.Empty:
+                                        break
+                                    except Exception:
+                                        break
+                            except Exception:
+                                pass
+                            try:
+                                mp_queue.close()
+                            except Exception:
+                                pass
+                            try:
+                                mp_queue.join_thread(timeout=2)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             else:
+                # On other platforms, subprocess is safe
                 process = subprocess.Popen(
                     [
                         vlc_cmd,
@@ -397,63 +624,66 @@ class PlayerTesterFallback:
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL
                 )
-            
-            # Start a timer to stop VLC after playback duration
-            def stop_vlc():
-                time.sleep(self.playback_duration + 2)  # Add 2 seconds buffer
-                if process.poll() is None:  # Process still running
-                    try:
-                        process.terminate()
-                    except (OSError, ProcessLookupError) as e:
-                        logger.debug(f"Error terminating VLC process: {e}")
-            
-            timer_thread = threading.Thread(target=stop_vlc, daemon=True)
-            timer_thread.start()
-            
-            # Wait for process with timeout
-            try:
-                stdout, stderr = process.communicate(timeout=total_timeout)
-                return_code = process.returncode
-            except subprocess.TimeoutExpired:
-                # Try graceful termination first
+                
+                # Start a timer to stop VLC after playback duration
+                def stop_vlc():
+                    time.sleep(self.playback_duration + 2)  # Add 2 seconds buffer
+                    if process.poll() is None:  # Process still running
+                        try:
+                            process.terminate()
+                        except (OSError, ProcessLookupError) as e:
+                            logger.debug(f"Error terminating VLC process: {e}")
+                
+                timer_thread = threading.Thread(target=stop_vlc, daemon=True)
+                timer_thread.start()
+                
+                # Wait for process with timeout
                 try:
-                    process.terminate()
-                    stdout, stderr = process.communicate(timeout=5)
+                    stdout, stderr = process.communicate(timeout=total_timeout)
                     return_code = process.returncode
-                    if return_code == 0:
+                    
+                    elapsed_time = time.time() - start_time
+                    result["playback_duration_seconds"] = round(elapsed_time, 2)
+                    
+                    # Check return code
+                    if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
                         result["status"] = "success"
                         result["format_supported"] = True
+                        # Estimate connection time (first 20% of total time, max 5 seconds)
+                        connection_time = min(elapsed_time * 0.2, 5.0)
+                        result["connection_time_ms"] = int(connection_time * 1000)
                     else:
                         result["status"] = "error"
-                        result["errors"].append("Process timeout (terminated)")
+                        if return_code != -15:  # Don't add error for SIGTERM
+                            result["errors"].append(f"VLC returned error code {return_code}")
+                        if stderr:
+                            error_text = stderr.decode('utf-8', errors='ignore')
+                            if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
+                                result["error_details"] = error_text[:500]  # Limit error text
                 except subprocess.TimeoutExpired:
-                    # Force kill if terminate didn't work
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    return_code = -1
-                    result["status"] = "error"
-                    result["errors"].append("Process timeout (killed)")
-            
-            elapsed_time = time.time() - start_time
-            result["playback_duration_seconds"] = round(elapsed_time, 2)
-            
-            # Check return code
-            if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
-                if result["status"] != "error":
-                    result["status"] = "success"
-                    result["format_supported"] = True
-                # Estimate connection time (first 20% of total time, max 5 seconds)
-                connection_time = min(elapsed_time * 0.2, 5.0)
-                result["connection_time_ms"] = int(connection_time * 1000)
-            else:
-                if result["status"] != "error":
-                    result["status"] = "error"
-                if return_code != -15:  # Don't add error for SIGTERM
-                    result["errors"].append(f"VLC returned error code {return_code}")
-                if stderr:
-                    error_text = stderr.decode('utf-8', errors='ignore')
-                    if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
-                        result["error_details"] = error_text[:500]  # Limit error text
+                    # Try graceful termination first
+                    try:
+                        process.terminate()
+                        stdout, stderr = process.communicate(timeout=5)
+                        return_code = process.returncode
+                        elapsed_time = time.time() - start_time
+                        result["playback_duration_seconds"] = round(elapsed_time, 2)
+                        
+                        if return_code == 0:
+                            result["status"] = "success"
+                            result["format_supported"] = True
+                        else:
+                            result["status"] = "error"
+                            result["errors"].append("Process timeout (terminated)")
+                    except subprocess.TimeoutExpired:
+                        # Force kill if terminate didn't work
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        return_code = -1
+                        elapsed_time = time.time() - start_time
+                        result["playback_duration_seconds"] = round(elapsed_time, 2)
+                        result["status"] = "error"
+                        result["errors"].append("Process timeout (killed)")
         
         except FileNotFoundError:
             result["status"] = "error"

@@ -95,6 +95,11 @@ class Database:
                 ON request_logs(test_run_id)
             """)
             
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_request_logs_stream_id 
+                ON request_logs(stream_id)
+            """)
+            
             conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error initializing database: {e}")
@@ -107,7 +112,7 @@ class Database:
     
     def get_connection(self) -> sqlite3.Connection:
         """Get database connection"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row  # Enable column access by name
         return conn
     
@@ -212,6 +217,12 @@ class Database:
         if not isinstance(results, dict):
             raise ValueError("results must be a dictionary")
         
+        # Validate JSON serialization before database operation
+        try:
+            json_str = json.dumps(results)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Results cannot be serialized to JSON: {e}")
+        
         conn = None
         try:
             conn = self.get_connection()
@@ -231,20 +242,20 @@ class Database:
                         UPDATE test_runs 
                         SET phase = ?, results = ?
                         WHERE test_run_id = ?
-                    """, (phase, json.dumps(results), test_run_id))
+                    """, (phase, json_str, test_run_id))
                 else:
                     # Update results but keep the higher phase number and update timestamp
                     cursor.execute("""
                         UPDATE test_runs 
                         SET results = ?, timestamp = CURRENT_TIMESTAMP
                         WHERE test_run_id = ?
-                    """, (json.dumps(results), test_run_id))
+                    """, (json_str, test_run_id))
             else:
                 # Insert new record
                 cursor.execute("""
                     INSERT INTO test_runs (test_run_id, stream_id, phase, results)
                     VALUES (?, ?, ?, ?)
-                """, (test_run_id, stream_id, phase, json.dumps(results)))
+                """, (test_run_id, stream_id, phase, json_str))
             
             conn.commit()
         except sqlite3.Error as e:
