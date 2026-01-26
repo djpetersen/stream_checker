@@ -321,212 +321,31 @@ class ConnectivityChecker:
         # First, try ICY metadata (most reliable for streaming protocols)
         icy_metadata = self._get_icy_metadata(url)
         if icy_metadata:
-            logger.debug(f"Found ICY metadata: {list(icy_metadata.keys())}")
-            try:
-                if icy_metadata.get("icy-br"):
-                    params["bitrate_kbps"] = int(icy_metadata["icy-br"])
-                    logger.debug(f"Extracted bitrate from ICY: {params['bitrate_kbps']} kbps")
-            except (ValueError, TypeError) as e:
-                logger.debug(f"Could not parse ICY bitrate: {e}")
-            try:
-                if icy_metadata.get("icy-sr"):
-                    params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
-                    logger.debug(f"Extracted sample rate from ICY: {params['sample_rate_hz']} Hz")
-            except (ValueError, TypeError) as e:
-                logger.debug(f"Could not parse ICY sample rate: {e}")
-            # Infer codec from Content-Type if available
-            if icy_metadata.get("content-type"):
-                content_type = icy_metadata["content-type"].lower()
-                if "mp3" in content_type or "mpeg" in content_type:
-                    params["codec"] = "MP3"
-                    params["container"] = "MP3"
-                elif "aac" in content_type:
-                    params["codec"] = "AAC"
-                    params["container"] = "AAC"
-                elif "ogg" in content_type or "vorbis" in content_type:
-                    params["codec"] = "Vorbis"
-                    params["container"] = "OGG"
+            self._extract_params_from_icy(icy_metadata, params)
         
+        # Try to get stream sample and extract from headers/content
         response = None
         try:
-            # Try to get a small sample of the stream
-            # First try with Range header (some servers support it)
-            # If that fails, try without Range (for live streams)
             response = requests.get(
                 url,
-                timeout=(min(self.connection_timeout, 10), min(self.read_timeout, 10)),  # Shorter timeout
+                timeout=(min(self.connection_timeout, 10), min(self.read_timeout, 10)),
                 stream=True,
-                headers={"Range": "bytes=0-16384", "Icy-MetaData": "1"},  # Get first 16KB, request ICY metadata
+                headers={"Range": "bytes=0-16384", "Icy-MetaData": "1"},
                 verify=self.verify_ssl
             )
             
             logger.debug(f"Parameter extraction request status: {response.status_code}")
             
-            # Check Content-Type header for codec info
-            content_type = response.headers.get("Content-Type", "").lower()
-            logger.debug(f"Content-Type: {content_type}")
+            # Extract from Content-Type header
+            self._extract_params_from_content_type(response.headers, url, params)
             
-            if not params.get("codec"):  # Only set if not already set from ICY
-                if "mp3" in content_type or "mpeg" in content_type:
-                    params["codec"] = "MP3"
-                    params["container"] = "MP3"
-                    logger.debug("Inferred codec: MP3 from Content-Type")
-                elif "aac" in content_type:
-                    params["codec"] = "AAC"
-                    params["container"] = "AAC"
-                    logger.debug("Inferred codec: AAC from Content-Type")
-                elif "ogg" in content_type or "vorbis" in content_type:
-                    params["codec"] = "Vorbis"
-                    params["container"] = "OGG"
-                    logger.debug("Inferred codec: Vorbis from Content-Type")
-                elif "audio" in content_type:
-                    # Generic audio - try to infer from URL
-                    if url.endswith(".mp3") or ".mp3" in url.lower():
-                        params["codec"] = "MP3"
-                        logger.debug("Inferred codec: MP3 from URL")
-                    elif url.endswith(".aac") or ".aac" in url.lower():
-                        params["codec"] = "AAC"
-                        logger.debug("Inferred codec: AAC from URL")
+            # Extract from ICY headers in response
+            self._extract_params_from_response_headers(response.headers, params)
             
-            # Check for ICY headers in response (in case _get_icy_metadata didn't work)
-            if not params.get("bitrate_kbps"):
-                for key, value in response.headers.items():
-                    if key.lower() == "icy-br":
-                        try:
-                            params["bitrate_kbps"] = int(value)
-                            logger.debug(f"Extracted bitrate from header: {params['bitrate_kbps']} kbps")
-                        except (ValueError, TypeError) as e:
-                            logger.debug(f"Could not parse ICY-BR header: {e}")
-                    elif key.lower() == "icy-sr":
-                        try:
-                            params["sample_rate_hz"] = int(value)
-                            logger.debug(f"Extracted sample rate from header: {params['sample_rate_hz']} Hz")
-                        except (ValueError, TypeError) as e:
-                            logger.debug(f"Could not parse ICY-SR header: {e}")
-            
-            # Try to read stream data for mutagen parsing
-            # Accept 200 (OK), 206 (Partial Content), and 416 (Range Not Satisfiable - means we got data)
-            # For live streams, we might get 200 even without Range support
-            # Also try if status is 416 (Range Not Satisfiable) - server might have sent data anyway
+            # Try to extract from stream data using mutagen
             if response.status_code in [200, 206, 416]:
-                # Save to temporary file for mutagen
-                max_bytes = 16384  # Limit to 16KB
-                bytes_read = 0
-                tmp_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                        # Read a small chunk of the stream
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:  # Skip empty chunks
-                                tmp.write(chunk)
-                                bytes_read += len(chunk)
-                                if bytes_read >= max_bytes:  # Stop at limit
-                                    break
-                        tmp_path = tmp.name
-                    
-                    # Only try mutagen if we got some data
-                    if bytes_read > 0:
-                        logger.debug(f"Read {bytes_read} bytes for mutagen parsing")
-                        # Try to read with mutagen
-                        try:
-                            audio_file = mutagen.File(tmp_path)
-                            
-                            if audio_file:
-                                logger.debug(f"Successfully parsed audio file with mutagen: {type(audio_file)}")
-                                # Extract parameters based on file type
-                                if isinstance(audio_file, MP3):
-                                    params["codec"] = "MP3"
-                                    params["container"] = "MP3"
-                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                        try:
-                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                        except (TypeError, ZeroDivisionError):
-                                            pass
-                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                        try:
-                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                        except (TypeError, ValueError):
-                                            pass
-                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                        try:
-                                            channels = int(audio_file.info.channels)
-                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                        except (TypeError, ValueError):
-                                            pass
-                            
-                                elif isinstance(audio_file, MP4):
-                                    params["codec"] = "AAC"
-                                    params["container"] = "MP4"
-                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                        try:
-                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                        except (TypeError, ZeroDivisionError):
-                                            pass
-                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                        try:
-                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                        except (TypeError, ValueError):
-                                            pass
-                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                        try:
-                                            channels = int(audio_file.info.channels)
-                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                        except (TypeError, ValueError):
-                                            pass
-                            
-                                elif isinstance(audio_file, OggVorbis):
-                                    params["codec"] = "Vorbis"
-                                    params["container"] = "OGG"
-                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                        try:
-                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                        except (TypeError, ZeroDivisionError):
-                                            pass
-                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                        try:
-                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                        except (TypeError, ValueError):
-                                            pass
-                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                        try:
-                                            channels = int(audio_file.info.channels)
-                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                        except (TypeError, ValueError):
-                                            pass
-                            
-                                else:
-                                    # Generic mutagen file
-                                    params["codec"] = type(audio_file).__name__
-                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                        try:
-                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                        except (TypeError, ZeroDivisionError):
-                                            pass
-                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                        try:
-                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                        except (TypeError, ValueError):
-                                            pass
-                        
-                        except Exception as e:
-                            # Mutagen couldn't read it, might be a stream
-                            logger.debug(f"Could not read audio with mutagen: {e}")
-                    else:
-                        logger.debug("No data read from stream for mutagen parsing")
-                    
-                    # Clean up temp file
-                    try:
-                        if tmp_path and os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-                    except (OSError, PermissionError) as e:
-                        logger.debug(f"Could not delete temp file {tmp_path}: {e}")
-                except Exception as e:
-                    # Error writing temp file
-                    logger.debug(f"Error writing temp file: {e}")
+                self._extract_params_from_mutagen(response, params)
             else:
-                # Status code indicates error or Range not supported
-                # For many live streams, Range requests return 416 or other codes
-                # But we might still have gotten ICY headers, so that's OK
                 logger.debug(f"Stream request returned status {response.status_code}, continuing with available header data")
         
         except Exception as e:
@@ -541,6 +360,156 @@ class ConnectivityChecker:
                     logger.debug(f"Error closing response: {e}")
         
         return params
+    
+    def _extract_params_from_icy(self, icy_metadata: Dict[str, str], params: Dict[str, Any]):
+        """Extract parameters from ICY metadata"""
+        logger.debug(f"Found ICY metadata: {list(icy_metadata.keys())}")
+        try:
+            if icy_metadata.get("icy-br"):
+                params["bitrate_kbps"] = int(icy_metadata["icy-br"])
+                logger.debug(f"Extracted bitrate from ICY: {params['bitrate_kbps']} kbps")
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Could not parse ICY bitrate: {e}")
+        try:
+            if icy_metadata.get("icy-sr"):
+                params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
+                logger.debug(f"Extracted sample rate from ICY: {params['sample_rate_hz']} Hz")
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Could not parse ICY sample rate: {e}")
+        # Infer codec from Content-Type if available
+        if icy_metadata.get("content-type"):
+            content_type = icy_metadata["content-type"].lower()
+            if "mp3" in content_type or "mpeg" in content_type:
+                params["codec"] = "MP3"
+                params["container"] = "MP3"
+            elif "aac" in content_type:
+                params["codec"] = "AAC"
+                params["container"] = "AAC"
+            elif "ogg" in content_type or "vorbis" in content_type:
+                params["codec"] = "Vorbis"
+                params["container"] = "OGG"
+    
+    def _extract_params_from_content_type(self, headers: Dict[str, str], url: str, params: Dict[str, Any]):
+        """Extract codec from Content-Type header or URL"""
+        if params.get("codec"):  # Already set from ICY
+            return
+        
+        content_type = headers.get("Content-Type", "").lower()
+        logger.debug(f"Content-Type: {content_type}")
+        
+        if "mp3" in content_type or "mpeg" in content_type:
+            params["codec"] = "MP3"
+            params["container"] = "MP3"
+            logger.debug("Inferred codec: MP3 from Content-Type")
+        elif "aac" in content_type:
+            params["codec"] = "AAC"
+            params["container"] = "AAC"
+            logger.debug("Inferred codec: AAC from Content-Type")
+        elif "ogg" in content_type or "vorbis" in content_type:
+            params["codec"] = "Vorbis"
+            params["container"] = "OGG"
+            logger.debug("Inferred codec: Vorbis from Content-Type")
+        elif "audio" in content_type:
+            # Generic audio - try to infer from URL
+            if url.endswith(".mp3") or ".mp3" in url.lower():
+                params["codec"] = "MP3"
+                logger.debug("Inferred codec: MP3 from URL")
+            elif url.endswith(".aac") or ".aac" in url.lower():
+                params["codec"] = "AAC"
+                logger.debug("Inferred codec: AAC from URL")
+    
+    def _extract_params_from_response_headers(self, headers: Dict[str, str], params: Dict[str, Any]):
+        """Extract parameters from ICY headers in response"""
+        if params.get("bitrate_kbps") and params.get("sample_rate_hz"):
+            return  # Already extracted
+        
+        for key, value in headers.items():
+            if key.lower() == "icy-br" and not params.get("bitrate_kbps"):
+                try:
+                    params["bitrate_kbps"] = int(value)
+                    logger.debug(f"Extracted bitrate from header: {params['bitrate_kbps']} kbps")
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Could not parse ICY-BR header: {e}")
+            elif key.lower() == "icy-sr" and not params.get("sample_rate_hz"):
+                try:
+                    params["sample_rate_hz"] = int(value)
+                    logger.debug(f"Extracted sample rate from header: {params['sample_rate_hz']} Hz")
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Could not parse ICY-SR header: {e}")
+    
+    def _extract_params_from_mutagen(self, response: requests.Response, params: Dict[str, Any]):
+        """Extract parameters from stream data using mutagen"""
+        max_bytes = 16384  # Limit to 16KB
+        bytes_read = 0
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                # Read a small chunk of the stream
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # Skip empty chunks
+                        tmp.write(chunk)
+                        bytes_read += len(chunk)
+                        if bytes_read >= max_bytes:  # Stop at limit
+                            break
+                tmp_path = tmp.name
+            
+            # Only try mutagen if we got some data
+            if bytes_read > 0:
+                logger.debug(f"Read {bytes_read} bytes for mutagen parsing")
+                try:
+                    audio_file = mutagen.File(tmp_path)
+                    if audio_file:
+                        logger.debug(f"Successfully parsed audio file with mutagen: {type(audio_file)}")
+                        self._extract_params_from_audio_file(audio_file, params)
+                except Exception as e:
+                    # Mutagen couldn't read it, might be a stream
+                    logger.debug(f"Could not read audio with mutagen: {e}")
+            else:
+                logger.debug("No data read from stream for mutagen parsing")
+            
+            # Clean up temp file
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except (OSError, PermissionError) as e:
+                logger.debug(f"Could not delete temp file {tmp_path}: {e}")
+        except Exception as e:
+            # Error writing temp file
+            logger.debug(f"Error writing temp file: {e}")
+    
+    def _extract_params_from_audio_file(self, audio_file, params: Dict[str, Any]):
+        """Extract parameters from mutagen audio file object"""
+        # Set codec and container based on file type
+        if isinstance(audio_file, MP3):
+            params["codec"] = "MP3"
+            params["container"] = "MP3"
+        elif isinstance(audio_file, MP4):
+            params["codec"] = "AAC"
+            params["container"] = "MP4"
+        elif isinstance(audio_file, OggVorbis):
+            params["codec"] = "Vorbis"
+            params["container"] = "OGG"
+        else:
+            # Generic mutagen file
+            params["codec"] = type(audio_file).__name__
+        
+        # Extract common parameters
+        if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+            try:
+                params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+            except (TypeError, ZeroDivisionError):
+                pass
+        if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+            try:
+                params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+            except (TypeError, ValueError):
+                pass
+        if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+            try:
+                channels = int(audio_file.info.channels)
+                params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+            except (TypeError, ValueError):
+                pass
     
     def _extract_metadata(self, url: str) -> Dict[str, Any]:
         """Extract stream metadata"""
