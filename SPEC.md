@@ -1127,7 +1127,23 @@ fault_tolerance:
    - **Channels** (Mono, Stereo, etc.)
    - **Container Format** (if applicable)
 
-4. **Stream Metadata Extraction**
+4. **Stream Type Identification**
+   - **Stream Protocol/Type** identification and reporting
+   - Detect and report stream server type:
+     - **Icecast** (detected via ICY headers and Server header)
+     - **Shoutcast** (detected via ICY headers and Server header)
+     - **ICY Stream** (generic ICY-compatible stream)
+     - **HLS** (HTTP Live Streaming - detected via playlist format)
+     - **Direct HTTP/HTTPS** (standard HTTP audio stream)
+     - **Unknown/Other** (if type cannot be determined)
+   - Detection methods:
+     - ICY metadata headers (`icy-*` headers indicate ICY-compatible streams)
+     - Server header analysis (e.g., "Icecast 2.4.0", "SHOUTcast")
+     - Content-Type and URL pattern analysis
+     - HLS playlist detection (`.m3u8` extension or playlist format)
+   - Report stream type in results for user visibility
+
+5. **Stream Metadata Extraction**
    - Stream title
    - Genre
    - Artist/Station name
@@ -1135,14 +1151,14 @@ fault_tolerance:
    - URL
    - Any ICY metadata (for Icecast/Shoutcast)
 
-5. **Server Headers Analysis**
+6. **Server Headers Analysis**
    - Content-Type validation
    - CORS headers presence
    - Cache-Control headers
    - Server identification
    - Content-Length (if available)
 
-6. **HLS-Specific Checks**
+7. **HLS-Specific Checks**
    - Playlist parsing
    - Segment availability
    - Master playlist validation
@@ -1177,6 +1193,11 @@ fault_tolerance:
     "channels": "stereo",
     "container": "MP3"
   },
+  "stream_type": {
+    "type": "Icecast",
+    "detected_via": ["icy_headers", "server_header"],
+    "server_version": "Icecast 2.4.0"
+  },
   "metadata": {
     "title": "Example Radio Station",
     "genre": "Pop",
@@ -1202,6 +1223,7 @@ python stream_checker.py --url "https://example.com/stream.mp3" --phase 1
 
 - Successfully connects to stream
 - Extracts all available technical parameters
+- Identifies and reports stream type (Icecast/Shoutcast/ICY/HLS/Direct HTTP)
 - Validates SSL certificate (if HTTPS)
 - Parses stream metadata
 - Handles connection errors gracefully

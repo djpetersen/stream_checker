@@ -1,6 +1,7 @@
 """Phase 1: Stream connectivity and metadata extraction"""
 
 import os
+import re
 import time
 import ssl
 import socket
@@ -50,6 +51,7 @@ class ConnectivityChecker:
             "connectivity": {},
             "ssl_certificate": {},
             "stream_parameters": {},
+            "stream_type": {},
             "metadata": {},
             "server_headers": {},
             "hls_info": None
@@ -59,8 +61,11 @@ class ConnectivityChecker:
         connectivity_result = self._check_connectivity(url)
         result["connectivity"] = connectivity_result
         
-        if connectivity_result["status"] != "success":
-            return result  # Can't proceed if connection failed
+        # Only skip parameter extraction if connection completely failed (not just HTTP error)
+        # HTTP errors (4xx, 5xx) still allow us to try parameter extraction
+        if connectivity_result["status"] not in ["success", "error"]:
+            # Connection timeout, SSL error, etc. - can't proceed
+            return result
         
         # Check SSL certificate (if HTTPS)
         if url.startswith("https://"):
@@ -78,6 +83,10 @@ class ConnectivityChecker:
         headers_result = self._analyze_headers(url)
         result["server_headers"] = headers_result
         
+        # Detect stream type
+        stream_type_result = self._detect_stream_type(url, connectivity_result, headers_result)
+        result["stream_type"] = stream_type_result
+        
         # Check HLS if applicable
         if self._is_hls(url):
             hls_result = self._check_hls(url)
@@ -86,29 +95,106 @@ class ConnectivityChecker:
         return result
     
     def _check_connectivity(self, url: str) -> Dict[str, Any]:
-        """Check HTTP/HTTPS connectivity"""
+        """Check HTTP/HTTPS connectivity
+        
+        Tries HEAD first (faster), falls back to GET if HEAD is not supported.
+        Many streaming servers (Icecast/Shoutcast) don't support HEAD requests.
+        """
         start_time = time.time()
+        
+        # Standard headers for stream requests
+        headers = {
+            "User-Agent": "StreamChecker/1.0",
+            "Accept": "*/*",
+            "Icy-MetaData": "1"  # Request ICY metadata for Icecast/Shoutcast streams
+        }
         
         response = None
         try:
+            # Try HEAD first (faster, doesn't download data)
             response = requests.head(
                 url,
                 timeout=(self.connection_timeout, self.read_timeout),
                 allow_redirects=True,
                 verify=self.verify_ssl,
-                stream=True
+                stream=True,
+                headers=headers
             )
             
             response_time = int((time.time() - start_time) * 1000)
             
-            result = {
-                "status": "success",
-                "response_time_ms": response_time,
-                "http_status": response.status_code,
-                "content_type": response.headers.get("Content-Type", "unknown"),
-                "final_url": response.url if response.url != url else None
-            }
-            return result
+            # If HEAD returns 400 (Bad Request) or 405 (Method Not Allowed),
+            # the server likely doesn't support HEAD - try GET instead
+            if response.status_code in [400, 405]:
+                logger.debug(f"HEAD not supported (status {response.status_code}), trying GET for {url}")
+                if response:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                response = None
+                
+                # Fall back to GET - just check headers, don't read body
+                get_response = None
+                try:
+                    get_response = requests.get(
+                        url,
+                        timeout=(self.connection_timeout, min(self.read_timeout, 10)),  # Shorter timeout for GET
+                        allow_redirects=True,
+                        verify=self.verify_ssl,
+                        stream=True,  # Use stream to avoid downloading body
+                        headers=headers
+                    )
+                    # Don't read from stream - just check status and headers
+                    # This avoids potential crashes from reading certain stream types
+                    response_time = int((time.time() - start_time) * 1000)
+                    response = get_response
+                    get_response = None  # Don't close in finally if we're using it
+                except Exception as get_error:
+                    # If GET also fails, return error
+                    logger.warning(f"GET fallback also failed: {get_error}")
+                    if get_response:
+                        try:
+                            get_response.close()
+                        except Exception:
+                            pass
+                    return {
+                        "status": "error",
+                        "error": f"Both HEAD and GET failed. GET error: {str(get_error)}",
+                        "response_time_ms": int((time.time() - start_time) * 1000),
+                        "http_status": None
+                    }
+                finally:
+                    # Clean up get_response if we're not using it
+                    if get_response:
+                        try:
+                            get_response.close()
+                        except Exception:
+                            pass
+            
+            # Build result from response
+            if response:
+                result = {
+                    "status": "success",
+                    "response_time_ms": response_time,
+                    "http_status": response.status_code,
+                    "content_type": response.headers.get("Content-Type", "unknown"),
+                    "final_url": response.url if response.url != url else None
+                }
+                
+                # Check if HTTP status indicates an error
+                if response.status_code >= 400:
+                    result["status"] = "error"
+                    result["error"] = f"HTTP {response.status_code}: {response.reason}"
+                
+                return result
+            else:
+                # Should not reach here, but handle just in case
+                return {
+                    "status": "error",
+                    "error": "No response received",
+                    "response_time_ms": int((time.time() - start_time) * 1000)
+                }
         
         except requests.exceptions.Timeout:
             return {
@@ -227,145 +313,225 @@ class ConnectivityChecker:
             "codec": None,
             "sample_rate_hz": None,
             "channels": None,
-            "container": None
+            "container": None,
+            "container_format": None,
+            "bitrate_mode": None
         }
+        
+        # First, try ICY metadata (most reliable for streaming protocols)
+        icy_metadata = self._get_icy_metadata(url)
+        if icy_metadata:
+            logger.debug(f"Found ICY metadata: {list(icy_metadata.keys())}")
+            try:
+                if icy_metadata.get("icy-br"):
+                    params["bitrate_kbps"] = int(icy_metadata["icy-br"])
+                    logger.debug(f"Extracted bitrate from ICY: {params['bitrate_kbps']} kbps")
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Could not parse ICY bitrate: {e}")
+            try:
+                if icy_metadata.get("icy-sr"):
+                    params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
+                    logger.debug(f"Extracted sample rate from ICY: {params['sample_rate_hz']} Hz")
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Could not parse ICY sample rate: {e}")
+            # Infer codec from Content-Type if available
+            if icy_metadata.get("content-type"):
+                content_type = icy_metadata["content-type"].lower()
+                if "mp3" in content_type or "mpeg" in content_type:
+                    params["codec"] = "MP3"
+                    params["container"] = "MP3"
+                elif "aac" in content_type:
+                    params["codec"] = "AAC"
+                    params["container"] = "AAC"
+                elif "ogg" in content_type or "vorbis" in content_type:
+                    params["codec"] = "Vorbis"
+                    params["container"] = "OGG"
         
         response = None
         try:
             # Try to get a small sample of the stream
+            # First try with Range header (some servers support it)
+            # If that fails, try without Range (for live streams)
             response = requests.get(
                 url,
-                timeout=(self.connection_timeout, self.read_timeout),
+                timeout=(min(self.connection_timeout, 10), min(self.read_timeout, 10)),  # Shorter timeout
                 stream=True,
-                headers={"Range": "bytes=0-8192"},  # Get first 8KB
+                headers={"Range": "bytes=0-16384", "Icy-MetaData": "1"},  # Get first 16KB, request ICY metadata
                 verify=self.verify_ssl
             )
             
-            if response.status_code in [200, 206]:  # 206 is Partial Content
+            logger.debug(f"Parameter extraction request status: {response.status_code}")
+            
+            # Check Content-Type header for codec info
+            content_type = response.headers.get("Content-Type", "").lower()
+            logger.debug(f"Content-Type: {content_type}")
+            
+            if not params.get("codec"):  # Only set if not already set from ICY
+                if "mp3" in content_type or "mpeg" in content_type:
+                    params["codec"] = "MP3"
+                    params["container"] = "MP3"
+                    logger.debug("Inferred codec: MP3 from Content-Type")
+                elif "aac" in content_type:
+                    params["codec"] = "AAC"
+                    params["container"] = "AAC"
+                    logger.debug("Inferred codec: AAC from Content-Type")
+                elif "ogg" in content_type or "vorbis" in content_type:
+                    params["codec"] = "Vorbis"
+                    params["container"] = "OGG"
+                    logger.debug("Inferred codec: Vorbis from Content-Type")
+                elif "audio" in content_type:
+                    # Generic audio - try to infer from URL
+                    if url.endswith(".mp3") or ".mp3" in url.lower():
+                        params["codec"] = "MP3"
+                        logger.debug("Inferred codec: MP3 from URL")
+                    elif url.endswith(".aac") or ".aac" in url.lower():
+                        params["codec"] = "AAC"
+                        logger.debug("Inferred codec: AAC from URL")
+            
+            # Check for ICY headers in response (in case _get_icy_metadata didn't work)
+            if not params.get("bitrate_kbps"):
+                for key, value in response.headers.items():
+                    if key.lower() == "icy-br":
+                        try:
+                            params["bitrate_kbps"] = int(value)
+                            logger.debug(f"Extracted bitrate from header: {params['bitrate_kbps']} kbps")
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Could not parse ICY-BR header: {e}")
+                    elif key.lower() == "icy-sr":
+                        try:
+                            params["sample_rate_hz"] = int(value)
+                            logger.debug(f"Extracted sample rate from header: {params['sample_rate_hz']} Hz")
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Could not parse ICY-SR header: {e}")
+            
+            # Try to read stream data for mutagen parsing
+            # Accept 200 (OK), 206 (Partial Content), and 416 (Range Not Satisfiable - means we got data)
+            # For live streams, we might get 200 even without Range support
+            # Also try if status is 416 (Range Not Satisfiable) - server might have sent data anyway
+            if response.status_code in [200, 206, 416]:
                 # Save to temporary file for mutagen
                 max_bytes = 16384  # Limit to 16KB
                 bytes_read = 0
                 tmp_path = None
                 try:
                     with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        # Read a small chunk of the stream
                         for chunk in response.iter_content(chunk_size=8192):
                             if chunk:  # Skip empty chunks
                                 tmp.write(chunk)
                                 bytes_read += len(chunk)
-                                if bytes_read >= max_bytes or len(chunk) < 8192:  # Last chunk or limit reached
+                                if bytes_read >= max_bytes:  # Stop at limit
                                     break
                         tmp_path = tmp.name
-                
-                    # Try to read with mutagen
-                    try:
-                        audio_file = mutagen.File(tmp_path)
-                        
-                        if audio_file:
-                            # Extract parameters based on file type
-                            if isinstance(audio_file, MP3):
-                                params["codec"] = "MP3"
-                                params["container"] = "MP3"
-                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                    try:
-                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                    except (TypeError, ZeroDivisionError):
-                                        pass
-                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                    try:
-                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                    except (TypeError, ValueError):
-                                        pass
-                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                    try:
-                                        channels = int(audio_file.info.channels)
-                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                    except (TypeError, ValueError):
-                                        pass
-                            
-                            elif isinstance(audio_file, MP4):
-                                params["codec"] = "AAC"
-                                params["container"] = "MP4"
-                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                    try:
-                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                    except (TypeError, ZeroDivisionError):
-                                        pass
-                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                    try:
-                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                    except (TypeError, ValueError):
-                                        pass
-                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                    try:
-                                        channels = int(audio_file.info.channels)
-                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                    except (TypeError, ValueError):
-                                        pass
-                            
-                            elif isinstance(audio_file, OggVorbis):
-                                params["codec"] = "Vorbis"
-                                params["container"] = "OGG"
-                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                    try:
-                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                    except (TypeError, ZeroDivisionError):
-                                        pass
-                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                    try:
-                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                    except (TypeError, ValueError):
-                                        pass
-                                if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
-                                    try:
-                                        channels = int(audio_file.info.channels)
-                                        params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
-                                    except (TypeError, ValueError):
-                                        pass
-                            
-                            else:
-                                # Generic mutagen file
-                                params["codec"] = type(audio_file).__name__
-                                if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
-                                    try:
-                                        params["bitrate_kbps"] = audio_file.info.bitrate // 1000
-                                    except (TypeError, ZeroDivisionError):
-                                        pass
-                                if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
-                                    try:
-                                        params["sample_rate_hz"] = int(audio_file.info.sample_rate)
-                                    except (TypeError, ValueError):
-                                        pass
                     
-                    except Exception as e:
-                        # Mutagen couldn't read it, might be a stream
-                        logger.debug(f"Could not read audio with mutagen: {e}")
-                    finally:
-                        # Clean up temp file
+                    # Only try mutagen if we got some data
+                    if bytes_read > 0:
+                        logger.debug(f"Read {bytes_read} bytes for mutagen parsing")
+                        # Try to read with mutagen
                         try:
-                            if tmp_path and os.path.exists(tmp_path):
-                                os.unlink(tmp_path)
-                        except (OSError, PermissionError) as e:
-                            logger.debug(f"Could not delete temp file {tmp_path}: {e}")
+                            audio_file = mutagen.File(tmp_path)
+                            
+                            if audio_file:
+                                logger.debug(f"Successfully parsed audio file with mutagen: {type(audio_file)}")
+                                # Extract parameters based on file type
+                                if isinstance(audio_file, MP3):
+                                    params["codec"] = "MP3"
+                                    params["container"] = "MP3"
+                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                        try:
+                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                        except (TypeError, ZeroDivisionError):
+                                            pass
+                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                        try:
+                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                        except (TypeError, ValueError):
+                                            pass
+                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                        try:
+                                            channels = int(audio_file.info.channels)
+                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                        except (TypeError, ValueError):
+                                            pass
+                            
+                                elif isinstance(audio_file, MP4):
+                                    params["codec"] = "AAC"
+                                    params["container"] = "MP4"
+                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                        try:
+                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                        except (TypeError, ZeroDivisionError):
+                                            pass
+                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                        try:
+                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                        except (TypeError, ValueError):
+                                            pass
+                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                        try:
+                                            channels = int(audio_file.info.channels)
+                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                        except (TypeError, ValueError):
+                                            pass
+                            
+                                elif isinstance(audio_file, OggVorbis):
+                                    params["codec"] = "Vorbis"
+                                    params["container"] = "OGG"
+                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                        try:
+                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                        except (TypeError, ZeroDivisionError):
+                                            pass
+                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                        try:
+                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                        except (TypeError, ValueError):
+                                            pass
+                                    if hasattr(audio_file.info, 'channels') and audio_file.info.channels:
+                                        try:
+                                            channels = int(audio_file.info.channels)
+                                            params["channels"] = "stereo" if channels == 2 else "mono" if channels == 1 else f"{channels} channels"
+                                        except (TypeError, ValueError):
+                                            pass
+                            
+                                else:
+                                    # Generic mutagen file
+                                    params["codec"] = type(audio_file).__name__
+                                    if hasattr(audio_file.info, 'bitrate') and audio_file.info.bitrate:
+                                        try:
+                                            params["bitrate_kbps"] = audio_file.info.bitrate // 1000
+                                        except (TypeError, ZeroDivisionError):
+                                            pass
+                                    if hasattr(audio_file.info, 'sample_rate') and audio_file.info.sample_rate:
+                                        try:
+                                            params["sample_rate_hz"] = int(audio_file.info.sample_rate)
+                                        except (TypeError, ValueError):
+                                            pass
+                        
+                        except Exception as e:
+                            # Mutagen couldn't read it, might be a stream
+                            logger.debug(f"Could not read audio with mutagen: {e}")
+                    else:
+                        logger.debug("No data read from stream for mutagen parsing")
+                    
+                    # Clean up temp file
+                    try:
+                        if tmp_path and os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                    except (OSError, PermissionError) as e:
+                        logger.debug(f"Could not delete temp file {tmp_path}: {e}")
                 except Exception as e:
                     # Error writing temp file
                     logger.debug(f"Error writing temp file: {e}")
-            
-            # Try to get ICY metadata (for Icecast/Shoutcast streams)
-            icy_metadata = self._get_icy_metadata(url)
-            if icy_metadata:
-                try:
-                    if icy_metadata.get("icy-br"):
-                        params["bitrate_kbps"] = int(icy_metadata["icy-br"])
-                except (ValueError, TypeError):
-                    pass  # Invalid bitrate value, skip
-                try:
-                    if icy_metadata.get("icy-sr"):
-                        params["sample_rate_hz"] = int(icy_metadata["icy-sr"])
-                except (ValueError, TypeError):
-                    pass  # Invalid sample rate value, skip
+            else:
+                # Status code indicates error or Range not supported
+                # For many live streams, Range requests return 416 or other codes
+                # But we might still have gotten ICY headers, so that's OK
+                logger.debug(f"Stream request returned status {response.status_code}, continuing with available header data")
         
         except Exception as e:
-            params["error"] = str(e)
+            logger.debug(f"Error in parameter extraction: {e}")
+            # Don't set error in params - we might still have ICY metadata
         finally:
             # Ensure response is closed when using stream=True
             if response:
@@ -553,6 +719,108 @@ class ConnectivityChecker:
                     pass
         
         return headers_info
+    
+    def _detect_stream_type(self, url: str, connectivity_result: Dict[str, Any], headers_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect and identify the stream type/protocol
+        
+        Args:
+            url: Stream URL
+            connectivity_result: Results from connectivity check
+            headers_result: Results from header analysis
+            
+        Returns:
+            Dictionary with stream type information
+        """
+        stream_type = {
+            "type": "Unknown",
+            "detected_via": [],
+            "server_version": None,
+            "confidence": "low"
+        }
+        
+        try:
+            # Check for HLS first (most specific)
+            if self._is_hls(url):
+                stream_type["type"] = "HLS"
+                stream_type["detected_via"] = ["url_pattern"]
+                stream_type["confidence"] = "high"
+                return stream_type
+            
+            # Get ICY metadata to check for ICY-compatible streams
+            # Only try if connectivity was successful to avoid extra failed requests
+            has_icy_headers = False
+            if connectivity_result and connectivity_result.get("status") in ["success", "error"]:
+                try:
+                    icy_metadata = self._get_icy_metadata(url)
+                    has_icy_headers = icy_metadata is not None and len(icy_metadata) > 0
+                except Exception as e:
+                    logger.debug(f"Error getting ICY metadata for stream type detection: {e}")
+                    has_icy_headers = False
+            
+            # Check Server header for specific server identification
+            server_header = headers_result.get("server", "").lower() if headers_result else ""
+            
+            # Detect Icecast
+            if "icecast" in server_header:
+                stream_type["type"] = "Icecast"
+                stream_type["detected_via"] = ["server_header"]
+                # Extract version if available
+                version_match = re.search(r'icecast\s+([\d.]+)', server_header, re.IGNORECASE)
+                if version_match:
+                    stream_type["server_version"] = f"Icecast {version_match.group(1)}"
+                if has_icy_headers:
+                    stream_type["detected_via"].append("icy_headers")
+                stream_type["confidence"] = "high"
+                return stream_type
+            
+            # Detect Shoutcast
+            if "shoutcast" in server_header or "sc_trans" in server_header:
+                stream_type["type"] = "Shoutcast"
+                stream_type["detected_via"] = ["server_header"]
+                # Extract version if available
+                version_match = re.search(r'(?:shoutcast|sc_trans)\s*[/-]?\s*([\d.]+)', server_header, re.IGNORECASE)
+                if version_match:
+                    stream_type["server_version"] = f"Shoutcast {version_match.group(1)}"
+                if has_icy_headers:
+                    stream_type["detected_via"].append("icy_headers")
+                stream_type["confidence"] = "high"
+                return stream_type
+            
+            # Generic ICY stream (has ICY headers but server not identified)
+            if has_icy_headers:
+                stream_type["type"] = "ICY Stream"
+                stream_type["detected_via"] = ["icy_headers"]
+                stream_type["confidence"] = "medium"
+                return stream_type
+            
+            # Check Content-Type for direct HTTP audio streams
+            content_type = connectivity_result.get("content_type", "").lower() if connectivity_result else ""
+            if content_type and ("audio" in content_type or "mpeg" in content_type or "aac" in content_type):
+                stream_type["type"] = "Direct HTTP/HTTPS"
+                stream_type["detected_via"] = ["content_type"]
+                stream_type["confidence"] = "medium"
+                return stream_type
+            
+            # Check URL pattern as fallback
+            url_lower = url.lower()
+            if ".m3u8" in url_lower:
+                stream_type["type"] = "HLS"
+                stream_type["detected_via"] = ["url_pattern"]
+                stream_type["confidence"] = "high"
+                return stream_type
+            
+            # Default to Unknown
+            stream_type["type"] = "Unknown/Other"
+            stream_type["detected_via"] = []
+            stream_type["confidence"] = "low"
+        except Exception as e:
+            logger.warning(f"Error detecting stream type: {e}")
+            stream_type["type"] = "Unknown/Other"
+            stream_type["detected_via"] = []
+            stream_type["confidence"] = "low"
+            stream_type["error"] = str(e)
+        
+        return stream_type
     
     def _is_hls(self, url: str) -> bool:
         """Check if URL is an HLS stream"""

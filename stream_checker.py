@@ -132,6 +132,22 @@ def format_text_output(result: dict) -> str:
         if "error" in ssl:
             output.append(f"  {Fore.RED}✗{Style.RESET_ALL} {'Error':.<40} {ssl['error']}")
     
+    # Stream Type
+    if "stream_type" in result:
+        stream_type = result["stream_type"]
+        if stream_type.get("type"):
+            output.append(f"\n{Fore.YELLOW}{Style.BRIGHT}Stream Type{Style.RESET_ALL}")
+            output.append("-" * 60)
+            output.append(f"    {'Type':.<40} {stream_type['type']}")
+            if stream_type.get("server_version"):
+                output.append(f"    {'Server Version':.<40} {stream_type['server_version']}")
+            if stream_type.get("detected_via"):
+                detected_via = ", ".join(stream_type["detected_via"])
+                output.append(f"    {'Detected Via':.<40} {detected_via}")
+            if stream_type.get("confidence"):
+                confidence_color = Fore.GREEN if stream_type["confidence"] == "high" else Fore.YELLOW if stream_type["confidence"] == "medium" else Fore.RED
+                output.append(f"    {'Confidence':.<40} {confidence_color}{stream_type['confidence'].title()}{Style.RESET_ALL}")
+    
     # Stream Parameters
     if "stream_parameters" in result:
         output.append(f"\n{Fore.YELLOW}{Style.BRIGHT}Stream Parameters{Style.RESET_ALL}")

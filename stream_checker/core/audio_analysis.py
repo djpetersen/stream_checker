@@ -3,11 +3,65 @@
 import os
 import subprocess
 import tempfile
+import multiprocessing
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import logging
 
 logger = logging.getLogger("stream_checker")
+
+# Use spawn method on macOS to avoid fork issues
+# This must be set before any multiprocessing operations
+if hasattr(multiprocessing, 'get_start_method'):
+    try:
+        current_method = multiprocessing.get_start_method()
+        if current_method != 'spawn':
+            multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set or can't change
+        pass
+
+
+def _run_subprocess_safe(cmd, timeout, stdout, stderr):
+    """
+    Run subprocess in a spawned process to avoid fork issues on macOS.
+    This function runs in a separate process and returns the result via a queue.
+    """
+    try:
+        process = subprocess.run(
+            cmd,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout
+        )
+        return {
+            'returncode': process.returncode,
+            'stdout': process.stdout,
+            'stderr': process.stderr,
+            'success': True
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            'returncode': None,
+            'stdout': None,
+            'stderr': e.stderr if hasattr(e, 'stderr') else None,
+            'success': False,
+            'error': 'timeout'
+        }
+    except Exception as e:
+        return {
+            'returncode': None,
+            'stdout': None,
+            'stderr': None,
+            'success': False,
+            'error': str(e)
+        }
+
+
+def _run_subprocess_worker(queue, cmd, timeout):
+    """Worker function for multiprocessing - must be at module level for pickling"""
+    result = _run_subprocess_safe(cmd, timeout, subprocess.PIPE, subprocess.PIPE)
+    queue.put(result)
 
 
 class AudioAnalyzer:
@@ -98,10 +152,31 @@ class AudioAnalyzer:
         paths = ["ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
         for path in paths:
             try:
-                result = subprocess.run([path, "-version"], capture_output=True, timeout=2)
-                if result.returncode == 0:
-                    return path
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+                # Use multiprocessing to avoid fork issues
+                import platform
+                if platform.system() == "Darwin":
+                    # On macOS, use multiprocessing with spawn
+                    queue = multiprocessing.Queue()
+                    process = multiprocessing.Process(
+                        target=_run_subprocess_worker,
+                        args=(queue, [path, "-version"], 2)
+                    )
+                    process.start()
+                    process.join(timeout=5)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
+                        continue
+                    if not queue.empty():
+                        result = queue.get()
+                        if result.get('success') and result.get('returncode') == 0:
+                            return path
+                else:
+                    # On other platforms, subprocess is safe
+                    result = subprocess.run([path, "-version"], capture_output=True, timeout=2)
+                    if result.returncode == 0:
+                        return path
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
                 continue
         return None
     
@@ -131,15 +206,41 @@ class AudioAnalyzer:
             ]
             
             # Run ffmpeg with timeout
+            # Use multiprocessing with spawn on macOS to avoid fork issues
             timeout = self.sample_duration + 30  # Add buffer
-            process = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout
-            )
+            import platform
+            if platform.system() == "Darwin":
+                # On macOS, use multiprocessing with spawn to avoid fork crash
+                queue = multiprocessing.Queue()
+                process_obj = multiprocessing.Process(
+                    target=_run_subprocess_worker,
+                    args=(queue, cmd, timeout)
+                )
+                process_obj.start()
+                process_obj.join(timeout=timeout + 5)
+                if process_obj.is_alive():
+                    process_obj.terminate()
+                    process_obj.join()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                
+                if queue.empty():
+                    raise Exception("Subprocess result queue is empty")
+                
+                result = queue.get()
+                process_returncode = result.get('returncode')
+                process_stderr = result.get('stderr')
+            else:
+                # On other platforms, subprocess is safe
+                process = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout
+                )
+                process_returncode = process.returncode
+                process_stderr = process.stderr
             
-            if process.returncode == 0 and os.path.exists(temp_path):
+            if process_returncode == 0 and os.path.exists(temp_path):
                 file_size = os.path.getsize(temp_path)
                 if file_size > 0:
                     return temp_path
@@ -151,8 +252,8 @@ class AudioAnalyzer:
                         pass
                     return None
             else:
-                error_msg = process.stderr.decode('utf-8', errors='ignore') if process.stderr else "Unknown error"
-                logger.error(f"ffmpeg failed (code {process.returncode}): {error_msg}")
+                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
+                logger.error(f"ffmpeg failed (code {process_returncode}): {error_msg}")
                 if os.path.exists(temp_path):
                     try:
                         os.unlink(temp_path)
@@ -195,20 +296,51 @@ class AudioAnalyzer:
                 "-"  # Output to stdout
             ]
             
-            process = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30
-            )
+            # Use multiprocessing with spawn on macOS to avoid fork issues
+            import platform
+            if platform.system() == "Darwin":
+                # On macOS, use multiprocessing with spawn
+                queue = multiprocessing.Queue()
+                process_obj = multiprocessing.Process(
+                    target=_run_subprocess_worker,
+                    args=(queue, cmd, 30)
+                )
+                process_obj.start()
+                process_obj.join(timeout=35)
+                if process_obj.is_alive():
+                    process_obj.terminate()
+                    process_obj.join()
+                    logger.error("ffmpeg conversion timeout")
+                    return None, 0, 0
+                
+                if queue.empty():
+                    logger.error("Subprocess result queue is empty")
+                    return None, 0, 0
+                
+                result = queue.get()
+                process_returncode = result.get('returncode')
+                process_stdout = result.get('stdout')
+                process_stderr = result.get('stderr')
+            else:
+                # On other platforms, subprocess is safe
+                process = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30
+                )
+                process_returncode = process.returncode
+                process_stdout = process.stdout
+                process_stderr = process.stderr
             
-            if process.returncode != 0:
-                logger.error(f"ffmpeg conversion failed: {process.stderr.decode('utf-8', errors='ignore')}")
+            if process_returncode != 0:
+                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
+                logger.error(f"ffmpeg conversion failed: {error_msg}")
                 return None, 0, 0
             
             # Convert bytes to numpy array
-            raw_data = process.stdout
-            if len(raw_data) == 0:
+            raw_data = process_stdout
+            if not raw_data or len(raw_data) == 0:
                 logger.error("ffmpeg produced no audio data")
                 return None, 0, 0
             
