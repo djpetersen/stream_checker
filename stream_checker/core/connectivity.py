@@ -18,6 +18,8 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
+from stream_checker.utils.file_utils import safe_remove_file
+
 logger = logging.getLogger("stream_checker")
 
 
@@ -587,11 +589,7 @@ class ConnectivityChecker:
                         except Exception as e:
                             logger.debug(f"Error reading audio metadata: {e}")
                         finally:
-                            try:
-                                if tmp_path and os.path.exists(tmp_path):
-                                    os.unlink(tmp_path)
-                            except (OSError, PermissionError) as e:
-                                logger.debug(f"Could not delete temp file {tmp_path}: {e}")
+                            safe_remove_file(tmp_path, context="_extract_metadata")
                     except Exception as e:
                         # Error writing temp file
                         logger.debug(f"Error writing temp file: {e}")

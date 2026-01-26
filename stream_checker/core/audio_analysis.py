@@ -12,6 +12,7 @@ from stream_checker.utils.multiprocessing_utils import (
     cleanup_multiprocessing_queue,
     cleanup_multiprocessing_process
 )
+from stream_checker.utils.file_utils import safe_remove_file
 
 logger = logging.getLogger("stream_checker")
 
@@ -183,11 +184,7 @@ class AudioAnalyzer:
         
         finally:
             # Clean up temp file
-            try:
-                if audio_file and os.path.exists(audio_file):
-                    os.unlink(audio_file)
-            except (OSError, PermissionError) as e:
-                logger.debug(f"Could not delete temp file {audio_file}: {e}")
+            safe_remove_file(audio_file, context="analyze")
         
         return result
     
@@ -293,40 +290,8 @@ class AudioAnalyzer:
                     process_stderr = result.get('stderr')
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    try:
-                        if process_obj and process_obj.is_alive():
-                            process_obj.terminate()
-                            process_obj.join(timeout=1)
-                            if process_obj.is_alive():
-                                process_obj.kill()
-                                process_obj.join()
-                    except Exception:
-                        pass
-                    try:
-                        if queue is not None:
-                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
-                            try:
-                                # Get any remaining items (with timeout to avoid blocking)
-                                import queue as queue_module
-                                while True:
-                                    try:
-                                        queue.get(timeout=0.1)
-                                    except queue_module.Empty:
-                                        break
-                                    except Exception:
-                                        break
-                            except Exception:
-                                pass
-                            try:
-                                queue.close()
-                            except Exception:
-                                pass
-                            try:
-                                queue.join_thread(timeout=2)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                    cleanup_multiprocessing_process(process_obj, context="_download_audio_sample")
+                    cleanup_multiprocessing_queue(queue, context="_download_audio_sample")
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(
@@ -344,36 +309,21 @@ class AudioAnalyzer:
                     return temp_path
                 else:
                     logger.warning(f"ffmpeg produced empty file: {temp_path}")
-                    try:
-                        os.unlink(temp_path)
-                    except (OSError, PermissionError):
-                        pass
+                    safe_remove_file(temp_path, context="_download_audio_sample")
                     return None
             else:
                 error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
                 logger.error(f"ffmpeg failed (code {process_returncode}): {error_msg}")
-                if os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except (OSError, PermissionError):
-                        pass
+                safe_remove_file(temp_path, context="_download_audio_sample")
                 return None
         
         except subprocess.TimeoutExpired:
             logger.error("ffmpeg timeout")
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except (OSError, PermissionError):
-                    pass
+            safe_remove_file(temp_path, context="_download_audio_sample")
             return None
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except (OSError, PermissionError):
-                    pass
+            safe_remove_file(temp_path, context="_download_audio_sample")
             return None
     
     def _load_audio_raw(self, audio_file: str) -> Tuple[Optional[np.ndarray], int, int]:
