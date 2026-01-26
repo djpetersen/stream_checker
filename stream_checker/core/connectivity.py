@@ -130,8 +130,8 @@ class ConnectivityChecker:
                 if response:
                     try:
                         response.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Error closing response in _check_connectivity: {e}")
                 response = None
                 
                 # Fall back to GET - just check headers, don't read body
@@ -228,8 +228,8 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
     
     def _check_ssl_certificate(self, url: str) -> Dict[str, Any]:
         """Check SSL/TLS certificate"""
@@ -537,8 +537,8 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
         
         return params
     
@@ -637,8 +637,8 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
         
         return metadata
     
@@ -674,8 +674,8 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
     
     def _analyze_headers(self, url: str) -> Dict[str, Any]:
         """Analyze HTTP response headers"""
@@ -715,8 +715,8 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
         
         return headers_info
     
@@ -876,7 +876,7 @@ class ConnectivityChecker:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response: {e}")
         
         return hls_info

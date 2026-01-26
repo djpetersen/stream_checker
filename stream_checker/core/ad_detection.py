@@ -188,8 +188,8 @@ class AdDetector:
             if response:
                 try:
                     response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error closing response in _get_stream_metadata: {e}")
     
     def _is_ad_marker(self, title: str, genre: str) -> bool:
         """Check if metadata indicates an ad"""

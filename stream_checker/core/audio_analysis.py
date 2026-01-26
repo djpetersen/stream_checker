@@ -227,8 +227,8 @@ class AudioAnalyzer:
                                 if process_obj.is_alive():
                                     process_obj.kill()
                                     process_obj.join()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Error cleaning up process in _find_ffmpeg: {e}")
                         try:
                             if queue is not None:
                                 # CRITICAL: Properly drain and close queue to prevent semaphore leaks
@@ -240,20 +240,21 @@ class AudioAnalyzer:
                                             queue.get(timeout=0.1)
                                         except queue_module.Empty:
                                             break
-                                        except Exception:
+                                        except Exception as e:
+                                            logger.debug(f"Error draining queue in _find_ffmpeg: {e}")
                                             break
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Error in queue drain loop in _find_ffmpeg: {e}")
                                 try:
                                     queue.close()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Error closing queue in _find_ffmpeg: {e}")
                                 try:
                                     queue.join_thread(timeout=2)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                                except Exception as e:
+                                    logger.debug(f"Error joining queue thread in _find_ffmpeg: {e}")
+                        except Exception as e:
+                            logger.debug(f"Error in queue cleanup in _find_ffmpeg: {e}")
                 else:
                     # On other platforms, subprocess is safe
                     result = subprocess.run([path, "-version"], capture_output=True, timeout=2)

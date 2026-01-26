@@ -128,12 +128,13 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
             try:
                 process.terminate()
                 process.wait(timeout=1)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error terminating VLC process in worker: {e}")
                 try:
                     process.kill()
                     process.wait()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.debug(f"Error killing VLC process in worker: {e2}")
 
 
 class PlayerTester:
@@ -444,8 +445,8 @@ class PlayerTesterFallback:
                                 if process_obj.is_alive():
                                     process_obj.kill()
                                     process_obj.join()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Error cleaning up process in _find_vlc_command: {e}")
                         try:
                             if mp_queue is not None:
                                 # CRITICAL: Properly drain and close queue to prevent semaphore leaks
@@ -457,20 +458,21 @@ class PlayerTesterFallback:
                                             mp_queue.get(timeout=0.1)
                                         except queue_module.Empty:
                                             break
-                                        except Exception:
+                                        except Exception as e:
+                                            logger.debug(f"Error draining queue in _find_vlc_command: {e}")
                                             break
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Error in queue drain loop in _find_vlc_command: {e}")
                                 try:
                                     mp_queue.close()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Error closing queue in _find_vlc_command: {e}")
                                 try:
                                     mp_queue.join_thread(timeout=2)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                                except Exception as e:
+                                    logger.debug(f"Error joining queue thread in _find_vlc_command: {e}")
+                        except Exception as e:
+                            logger.debug(f"Error in queue cleanup in _find_vlc_command: {e}")
                 else:
                     result = subprocess.run(
                         [path, "--version"],
@@ -581,8 +583,8 @@ class PlayerTesterFallback:
                             if process_obj.is_alive():
                                 process_obj.kill()
                                 process_obj.join()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Error cleaning up process in PlayerTesterFallback.check: {e}")
                     try:
                         if mp_queue is not None:
                             # CRITICAL: Properly drain and close queue to prevent semaphore leaks
@@ -594,20 +596,21 @@ class PlayerTesterFallback:
                                         mp_queue.get(timeout=0.1)
                                     except queue_module.Empty:
                                         break
-                                    except Exception:
+                                    except Exception as e:
+                                        logger.debug(f"Error draining queue in PlayerTesterFallback.check: {e}")
                                         break
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"Error in queue drain loop in PlayerTesterFallback.check: {e}")
                             try:
                                 mp_queue.close()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"Error closing queue in PlayerTesterFallback.check: {e}")
                             try:
                                 mp_queue.join_thread(timeout=2)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                            except Exception as e:
+                                logger.debug(f"Error joining queue thread in PlayerTesterFallback.check: {e}")
+                    except Exception as e:
+                        logger.debug(f"Error in queue cleanup in PlayerTesterFallback.check: {e}")
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.Popen(
