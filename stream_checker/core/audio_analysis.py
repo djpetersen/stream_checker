@@ -8,6 +8,11 @@ import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import logging
 
+from stream_checker.utils.multiprocessing_utils import (
+    cleanup_multiprocessing_queue,
+    cleanup_multiprocessing_process
+)
+
 logger = logging.getLogger("stream_checker")
 
 # Use spawn method on macOS to avoid fork issues
@@ -220,41 +225,8 @@ class AudioAnalyzer:
                                 return path
                     finally:
                         # Clean up resources - CRITICAL to prevent semaphore leaks
-                        try:
-                            if process_obj and process_obj.is_alive():
-                                process_obj.terminate()
-                                process_obj.join(timeout=1)
-                                if process_obj.is_alive():
-                                    process_obj.kill()
-                                    process_obj.join()
-                        except Exception as e:
-                            logger.debug(f"Error cleaning up process in _find_ffmpeg: {e}")
-                        try:
-                            if queue is not None:
-                                # CRITICAL: Properly drain and close queue to prevent semaphore leaks
-                                try:
-                                    # Get any remaining items (with timeout to avoid blocking)
-                                    import queue as queue_module
-                                    while True:
-                                        try:
-                                            queue.get(timeout=0.1)
-                                        except queue_module.Empty:
-                                            break
-                                        except Exception as e:
-                                            logger.debug(f"Error draining queue in _find_ffmpeg: {e}")
-                                            break
-                                except Exception as e:
-                                    logger.debug(f"Error in queue drain loop in _find_ffmpeg: {e}")
-                                try:
-                                    queue.close()
-                                except Exception as e:
-                                    logger.debug(f"Error closing queue in _find_ffmpeg: {e}")
-                                try:
-                                    queue.join_thread(timeout=2)
-                                except Exception as e:
-                                    logger.debug(f"Error joining queue thread in _find_ffmpeg: {e}")
-                        except Exception as e:
-                            logger.debug(f"Error in queue cleanup in _find_ffmpeg: {e}")
+                        cleanup_multiprocessing_process(process_obj, context="_find_ffmpeg")
+                        cleanup_multiprocessing_queue(queue, context="_find_ffmpeg")
                 else:
                     # On other platforms, subprocess is safe
                     result = subprocess.run([path, "-version"], capture_output=True, timeout=2)
@@ -456,40 +428,8 @@ class AudioAnalyzer:
                     process_stderr = result.get('stderr')
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    try:
-                        if process_obj and process_obj.is_alive():
-                            process_obj.terminate()
-                            process_obj.join(timeout=1)
-                            if process_obj.is_alive():
-                                process_obj.kill()
-                                process_obj.join()
-                    except Exception:
-                        pass
-                    try:
-                        if queue is not None:
-                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
-                            try:
-                                # Get any remaining items (with timeout to avoid blocking)
-                                import queue as queue_module
-                                while True:
-                                    try:
-                                        queue.get(timeout=0.1)
-                                    except queue_module.Empty:
-                                        break
-                                    except Exception:
-                                        break
-                            except Exception:
-                                pass
-                            try:
-                                queue.close()
-                            except Exception:
-                                pass
-                            try:
-                                queue.join_thread(timeout=2)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                    cleanup_multiprocessing_process(process_obj, context="_load_audio_raw")
+                    cleanup_multiprocessing_queue(queue, context="_load_audio_raw")
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(

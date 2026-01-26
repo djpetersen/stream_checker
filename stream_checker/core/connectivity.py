@@ -612,7 +612,23 @@ class ConnectivityChecker:
         return metadata
     
     def _get_icy_metadata(self, url: str) -> Optional[Dict[str, str]]:
-        """Get ICY metadata from Icecast/Shoutcast stream"""
+        """Get ICY metadata from Icecast/Shoutcast stream
+        
+        Args:
+            url: Stream URL to get metadata from
+            
+        Returns:
+            Dictionary of ICY headers or None if not available
+        """
+        # Basic URL validation
+        if not url or not isinstance(url, str):
+            logger.debug("Invalid URL provided to _get_icy_metadata")
+            return None
+        
+        if not url.startswith(("http://", "https://")):
+            logger.debug(f"URL does not start with http:// or https://: {url[:50]}")
+            return None
+        
         response = None
         try:
             response = requests.get(

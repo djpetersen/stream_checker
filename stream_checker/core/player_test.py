@@ -9,6 +9,11 @@ import os
 from typing import Dict, Any, Optional
 import logging
 
+from stream_checker.utils.multiprocessing_utils import (
+    cleanup_multiprocessing_queue,
+    cleanup_multiprocessing_process
+)
+
 # Use spawn method on macOS to avoid fork issues
 # Defer setting until actually needed to avoid conflicts in Flask/multi-threaded environments
 _mp_start_method_set = False
@@ -438,41 +443,8 @@ class PlayerTesterFallback:
                                 return path
                     finally:
                         # Clean up resources - CRITICAL to prevent semaphore leaks
-                        try:
-                            if process_obj and process_obj.is_alive():
-                                process_obj.terminate()
-                                process_obj.join(timeout=1)
-                                if process_obj.is_alive():
-                                    process_obj.kill()
-                                    process_obj.join()
-                        except Exception as e:
-                            logger.debug(f"Error cleaning up process in _find_vlc_command: {e}")
-                        try:
-                            if mp_queue is not None:
-                                # CRITICAL: Properly drain and close queue to prevent semaphore leaks
-                                try:
-                                    # Get any remaining items (with timeout to avoid blocking)
-                                    import queue as queue_module
-                                    while True:
-                                        try:
-                                            mp_queue.get(timeout=0.1)
-                                        except queue_module.Empty:
-                                            break
-                                        except Exception as e:
-                                            logger.debug(f"Error draining queue in _find_vlc_command: {e}")
-                                            break
-                                except Exception as e:
-                                    logger.debug(f"Error in queue drain loop in _find_vlc_command: {e}")
-                                try:
-                                    mp_queue.close()
-                                except Exception as e:
-                                    logger.debug(f"Error closing queue in _find_vlc_command: {e}")
-                                try:
-                                    mp_queue.join_thread(timeout=2)
-                                except Exception as e:
-                                    logger.debug(f"Error joining queue thread in _find_vlc_command: {e}")
-                        except Exception as e:
-                            logger.debug(f"Error in queue cleanup in _find_vlc_command: {e}")
+                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command")
+                        cleanup_multiprocessing_queue(mp_queue, context="_find_vlc_command")
                 else:
                     result = subprocess.run(
                         [path, "--version"],
@@ -576,41 +548,8 @@ class PlayerTesterFallback:
                                 result["error_details"] = error_text[:500]  # Limit error text
                 finally:
                     # Clean up resources - CRITICAL to prevent semaphore leaks
-                    try:
-                        if process_obj and process_obj.is_alive():
-                            process_obj.terminate()
-                            process_obj.join(timeout=1)
-                            if process_obj.is_alive():
-                                process_obj.kill()
-                                process_obj.join()
-                    except Exception as e:
-                        logger.debug(f"Error cleaning up process in PlayerTesterFallback.check: {e}")
-                    try:
-                        if mp_queue is not None:
-                            # CRITICAL: Properly drain and close queue to prevent semaphore leaks
-                            try:
-                                # Get any remaining items (with timeout to avoid blocking)
-                                import queue as queue_module
-                                while True:
-                                    try:
-                                        mp_queue.get(timeout=0.1)
-                                    except queue_module.Empty:
-                                        break
-                                    except Exception as e:
-                                        logger.debug(f"Error draining queue in PlayerTesterFallback.check: {e}")
-                                        break
-                            except Exception as e:
-                                logger.debug(f"Error in queue drain loop in PlayerTesterFallback.check: {e}")
-                            try:
-                                mp_queue.close()
-                            except Exception as e:
-                                logger.debug(f"Error closing queue in PlayerTesterFallback.check: {e}")
-                            try:
-                                mp_queue.join_thread(timeout=2)
-                            except Exception as e:
-                                logger.debug(f"Error joining queue thread in PlayerTesterFallback.check: {e}")
-                    except Exception as e:
-                        logger.debug(f"Error in queue cleanup in PlayerTesterFallback.check: {e}")
+                    cleanup_multiprocessing_process(process_obj, context="PlayerTesterFallback.check")
+                    cleanup_multiprocessing_queue(mp_queue, context="PlayerTesterFallback.check")
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.Popen(

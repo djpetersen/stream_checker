@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from contextlib import contextmanager
 
 logger = logging.getLogger("stream_checker")
 
@@ -116,6 +117,21 @@ class Database:
         conn.row_factory = sqlite3.Row  # Enable column access by name
         return conn
     
+    @contextmanager
+    def _get_connection_context(self):
+        """Context manager for database connections"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            yield conn
+        except sqlite3.Error:
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
+    
     def add_stream(self, stream_id: str, url: str, name: Optional[str] = None):
         """
         Add or update stream
@@ -134,24 +150,13 @@ class Database:
         if not url or not isinstance(url, str):
             raise ValueError("url must be a non-empty string")
         
-        conn = None
-        try:
-            conn = self.get_connection()
+        with self._get_connection_context() as conn:
             cursor = conn.cursor()
-            
             cursor.execute("""
                 INSERT OR REPLACE INTO streams (stream_id, url, name, last_tested)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             """, (stream_id, url, name))
-            
             conn.commit()
-        except sqlite3.Error as e:
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                conn.close()
     
     def update_stream_test_count(self, stream_id: str):
         """
@@ -167,26 +172,15 @@ class Database:
         if not stream_id or not isinstance(stream_id, str):
             raise ValueError("stream_id must be a non-empty string")
         
-        conn = None
-        try:
-            conn = self.get_connection()
+        with self._get_connection_context() as conn:
             cursor = conn.cursor()
-            
             cursor.execute("""
                 UPDATE streams 
                 SET test_count = test_count + 1,
                     last_tested = CURRENT_TIMESTAMP
                 WHERE stream_id = ?
             """, (stream_id,))
-            
             conn.commit()
-        except sqlite3.Error as e:
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                conn.close()
     
     def add_test_run(
         self,
@@ -223,9 +217,7 @@ class Database:
         except (TypeError, ValueError) as e:
             raise ValueError(f"Results cannot be serialized to JSON: {e}")
         
-        conn = None
-        try:
-            conn = self.get_connection()
+        with self._get_connection_context() as conn:
             cursor = conn.cursor()
             
             # Check if test_run_id already exists
@@ -258,13 +250,6 @@ class Database:
                 """, (test_run_id, stream_id, phase, json_str))
             
             conn.commit()
-        except sqlite3.Error as e:
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                conn.close()
     
     def get_stream_history(self, stream_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
@@ -290,36 +275,31 @@ class Database:
         if not stream_id or not isinstance(stream_id, str):
             raise ValueError("stream_id must be a non-empty string")
         
-        conn = None
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT test_run_id, timestamp, phase, results
-                FROM test_runs
-                WHERE stream_id = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (stream_id, limit))
-            
-            rows = cursor.fetchall()
-            
-            return [
-                {
-                    "test_run_id": row["test_run_id"],
-                    "timestamp": row["timestamp"],
-                    "phase": row["phase"],
-                    "results": json.loads(row["results"])
-                }
-                for row in rows
-            ]
+            with self._get_connection_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT test_run_id, timestamp, phase, results
+                    FROM test_runs
+                    WHERE stream_id = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (stream_id, limit))
+                
+                rows = cursor.fetchall()
+                
+                return [
+                    {
+                        "test_run_id": row["test_run_id"],
+                        "timestamp": row["timestamp"],
+                        "phase": row["phase"],
+                        "results": json.loads(row["results"])
+                    }
+                    for row in rows
+                ]
         except (sqlite3.Error, json.JSONDecodeError) as e:
             logger.error(f"Error getting stream history: {e}")
             return []
-        finally:
-            if conn:
-                conn.close()
     
     def get_stream_info(self, stream_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -338,35 +318,30 @@ class Database:
         if not stream_id or not isinstance(stream_id, str):
             raise ValueError("stream_id must be a non-empty string")
         
-        conn = None
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT stream_id, url, name, created_at, last_tested, test_count
-                FROM streams
-                WHERE stream_id = ?
-            """, (stream_id,))
-            
-            row = cursor.fetchone()
-            
-            if row:
-                return {
-                    "stream_id": row["stream_id"],
-                    "url": row["url"],
-                    "name": row["name"],
-                    "created_at": row["created_at"],
-                    "last_tested": row["last_tested"],
-                    "test_count": row["test_count"]
-                }
-            return None
+            with self._get_connection_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT stream_id, url, name, created_at, last_tested, test_count
+                    FROM streams
+                    WHERE stream_id = ?
+                """, (stream_id,))
+                
+                row = cursor.fetchone()
+                
+                if row:
+                    return {
+                        "stream_id": row["stream_id"],
+                        "url": row["url"],
+                        "name": row["name"],
+                        "created_at": row["created_at"],
+                        "last_tested": row["last_tested"],
+                        "test_count": row["test_count"]
+                    }
+                return None
         except sqlite3.Error as e:
             logger.error(f"Error getting stream info: {e}")
             return None
-        finally:
-            if conn:
-                conn.close()
     
     def log_request(
         self,
@@ -415,11 +390,8 @@ class Database:
         if processing_time_ms is not None and not isinstance(processing_time_ms, int):
             raise ValueError("processing_time_ms must be an integer or None")
         
-        conn = None
-        try:
-            conn = self.get_connection()
+        with self._get_connection_context() as conn:
             cursor = conn.cursor()
-            
             cursor.execute("""
                 INSERT INTO request_logs (
                     ip_address, stream_url, test_run_id, stream_id,
@@ -436,14 +408,6 @@ class Database:
             request_id = cursor.lastrowid
             conn.commit()
             return request_id
-        except sqlite3.Error as e:
-            if conn:
-                conn.rollback()
-            logger.error(f"Error logging request: {e}")
-            raise
-        finally:
-            if conn:
-                conn.close()
     
     def get_request_history(
         self,
@@ -477,65 +441,63 @@ class Database:
         if start_time and end_time and start_time > end_time:
             raise ValueError("start_time must be before end_time")
         
-        conn = None
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            query = """
-                SELECT request_id, ip_address, request_timestamp, stream_url,
-                       test_run_id, stream_id, user_agent, request_method,
-                       response_status, processing_time_ms
-                FROM request_logs
-                WHERE 1=1
-            """
-            params = []
-            
-            if ip_address:
-                if not isinstance(ip_address, str) or not ip_address.strip():
-                    raise ValueError("ip_address must be a non-empty string")
-                query += " AND ip_address = ?"
-                params.append(ip_address.strip())
-            
-            if start_time:
-                if not isinstance(start_time, datetime):
-                    raise ValueError("start_time must be a datetime object")
-                query += " AND request_timestamp >= ?"
-                params.append(start_time.isoformat())
-            
-            if end_time:
-                if not isinstance(end_time, datetime):
-                    raise ValueError("end_time must be a datetime object")
-                query += " AND request_timestamp <= ?"
-                params.append(end_time.isoformat())
-            
-            query += " ORDER BY request_timestamp DESC LIMIT ?"
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            
-            return [
-                {
-                    "request_id": row["request_id"],
-                    "ip_address": row["ip_address"],
-                    "request_timestamp": row["request_timestamp"],
-                    "stream_url": row["stream_url"],
-                    "test_run_id": row["test_run_id"],
-                    "stream_id": row["stream_id"],
-                    "user_agent": row["user_agent"],
-                    "request_method": row["request_method"],
-                    "response_status": row["response_status"],
-                    "processing_time_ms": row["processing_time_ms"]
-                }
-                for row in rows
-            ]
+            with self._get_connection_context() as conn:
+                cursor = conn.cursor()
+                
+                # Build query safely with parameterized conditions
+                query_parts = [
+                    "SELECT request_id, ip_address, request_timestamp, stream_url",
+                    "test_run_id, stream_id, user_agent, request_method",
+                    "response_status, processing_time_ms",
+                    "FROM request_logs",
+                    "WHERE 1=1"
+                ]
+                params = []
+                
+                if ip_address:
+                    if not isinstance(ip_address, str) or not ip_address.strip():
+                        raise ValueError("ip_address must be a non-empty string")
+                    query_parts.append("AND ip_address = ?")
+                    params.append(ip_address.strip())
+                
+                if start_time:
+                    if not isinstance(start_time, datetime):
+                        raise ValueError("start_time must be a datetime object")
+                    query_parts.append("AND request_timestamp >= ?")
+                    params.append(start_time.isoformat())
+                
+                if end_time:
+                    if not isinstance(end_time, datetime):
+                        raise ValueError("end_time must be a datetime object")
+                    query_parts.append("AND request_timestamp <= ?")
+                    params.append(end_time.isoformat())
+                
+                query_parts.append("ORDER BY request_timestamp DESC LIMIT ?")
+                params.append(limit)
+                
+                query = " ".join(query_parts)
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                return [
+                    {
+                        "request_id": row["request_id"],
+                        "ip_address": row["ip_address"],
+                        "request_timestamp": row["request_timestamp"],
+                        "stream_url": row["stream_url"],
+                        "test_run_id": row["test_run_id"],
+                        "stream_id": row["stream_id"],
+                        "user_agent": row["user_agent"],
+                        "request_method": row["request_method"],
+                        "response_status": row["response_status"],
+                        "processing_time_ms": row["processing_time_ms"]
+                    }
+                    for row in rows
+                ]
         except sqlite3.Error as e:
             logger.error(f"Error getting request history: {e}")
             return []
-        finally:
-            if conn:
-                conn.close()
     
     def get_ip_request_count(
         self,
@@ -563,27 +525,23 @@ class Database:
         if time_window_minutes > 1440:  # 24 hours
             raise ValueError("time_window_minutes cannot exceed 1440 (24 hours)")
         
-        conn = None
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            # Use CAST to ensure time_window_minutes is treated as integer
-            # This prevents SQL injection and ensures correct datetime calculation
-            cursor.execute("""
-                SELECT COUNT(*) as count
-                FROM request_logs
-                WHERE ip_address = ?
-                AND request_timestamp >= datetime('now', '-' || CAST(? AS TEXT) || ' minutes')
-            """, (ip_address, time_window_minutes))
-            
-            row = cursor.fetchone()
-            if row:
-                return int(row["count"])
-            return 0
+            with self._get_connection_context() as conn:
+                cursor = conn.cursor()
+                
+                # Use CAST to ensure time_window_minutes is treated as integer
+                # This prevents SQL injection and ensures correct datetime calculation
+                cursor.execute("""
+                    SELECT COUNT(*) as count
+                    FROM request_logs
+                    WHERE ip_address = ?
+                    AND request_timestamp >= datetime('now', '-' || CAST(? AS TEXT) || ' minutes')
+                """, (ip_address, time_window_minutes))
+                
+                row = cursor.fetchone()
+                if row:
+                    return int(row["count"])
+                return 0
         except sqlite3.Error as e:
             logger.error(f"Error getting IP request count: {e}")
             return 0
-        finally:
-            if conn:
-                conn.close()
