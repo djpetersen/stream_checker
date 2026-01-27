@@ -1,6 +1,7 @@
 """Phase 3: Audio analysis - silence and error detection"""
 
 import os
+import shutil
 import subprocess
 import tempfile
 import multiprocessing
@@ -10,51 +11,15 @@ import logging
 
 from stream_checker.utils.multiprocessing_utils import (
     cleanup_multiprocessing_queue,
-    cleanup_multiprocessing_process
+    cleanup_multiprocessing_process,
+    ensure_spawn_method,
+    run_process_with_queue,
+    run_process_with_pipe,
+    _run_subprocess_worker_pipe
 )
 from stream_checker.utils.file_utils import safe_remove_file
 
 logger = logging.getLogger("stream_checker")
-
-# Use spawn method on macOS to avoid fork issues
-# Defer setting until actually needed to avoid conflicts in Flask/multi-threaded environments
-_mp_start_method_set = False
-
-def _ensure_spawn_method():
-    """Ensure multiprocessing uses spawn method on macOS - call only when needed"""
-    global _mp_start_method_set
-    if _mp_start_method_set:
-        return
-    
-    if hasattr(multiprocessing, 'get_start_method'):
-        try:
-            import platform
-            if platform.system() != "Darwin":
-                _mp_start_method_set = True
-                return
-            
-            current_method = multiprocessing.get_start_method(allow_none=True)
-            if current_method is None:
-                # Not set yet, set it to spawn on macOS
-                try:
-                    multiprocessing.set_start_method('spawn')
-                    _mp_start_method_set = True
-                except RuntimeError:
-                    # Can't set - might already be set in another process
-                    pass
-            elif current_method == 'spawn':
-                _mp_start_method_set = True
-            else:
-                # Try to change it, but don't force (may fail in some contexts)
-                try:
-                    multiprocessing.set_start_method('spawn', force=True)
-                    _mp_start_method_set = True
-                except RuntimeError:
-                    # Already set or can't change - this is OK
-                    pass
-        except RuntimeError:
-            # Already set or can't change - this is OK
-            pass
 
 
 def _run_subprocess_safe(cmd, timeout, stdout, stderr):
@@ -95,18 +60,36 @@ def _run_subprocess_safe(cmd, timeout, stdout, stderr):
 
 def _run_subprocess_worker(queue, cmd, timeout):
     """Worker function for multiprocessing - must be at module level for pickling"""
+    result = None
     try:
         result = _run_subprocess_safe(cmd, timeout, subprocess.PIPE, subprocess.PIPE)
-        queue.put(result)
     except Exception as e:
-        # Put error result in queue so caller knows something went wrong
-        queue.put({
+        # Create error result
+        result = {
             'success': False,
             'returncode': None,
             'stdout': None,
             'stderr': None,
             'error': str(e)
-        })
+        }
+    finally:
+        # Always try to put result, even if it's None
+        try:
+            if result is not None:
+                queue.put(result)
+            else:
+                # Fallback if result is somehow None
+                queue.put({
+                    'success': False,
+                    'returncode': None,
+                    'stdout': None,
+                    'stderr': None,
+                    'error': 'Unknown error in worker'
+                })
+        except Exception as e:
+            # If queue.put fails (e.g., queue is closed), we can't do anything
+            # The parent will timeout and clean up
+            pass
     # Note: Don't close queue here - it's managed by the caller
 
 
@@ -161,16 +144,30 @@ class AudioAnalyzer:
         }
         
         # Download audio sample
-        audio_file = self._download_audio_sample(url)
+        skip_download = os.environ.get("STREAM_CHECKER_SKIP_DOWNLOAD") == "1"
+        if skip_download:
+            logger.info("_download_audio_sample skipped (STREAM_CHECKER_SKIP_DOWNLOAD=1)")
+            audio_file = None
+        else:
+            audio_file = self._download_audio_sample(url)
+        
         if not audio_file:
-            result["error"] = "Failed to download audio sample"
+            if not skip_download:
+                result["error"] = "Failed to download audio sample"
             return result
         
         try:
             # Load audio using ffmpeg to convert to raw PCM
-            audio_data, sample_rate, channels = self._load_audio_raw(audio_file)
+            skip_load_raw = os.environ.get("STREAM_CHECKER_SKIP_LOAD_RAW") == "1"
+            if skip_load_raw:
+                logger.info("_load_audio_raw skipped (STREAM_CHECKER_SKIP_LOAD_RAW=1)")
+                audio_data = None
+            else:
+                audio_data, sample_rate, channels = self._load_audio_raw(audio_file)
+            
             if audio_data is None:
-                result["error"] = "Failed to load audio data"
+                if not skip_load_raw:
+                    result["error"] = "Failed to load audio data"
                 return result
             
             # Analyze audio
@@ -184,54 +181,48 @@ class AudioAnalyzer:
         
         finally:
             # Clean up temp file
-            safe_remove_file(audio_file, context="analyze")
+            if audio_file:
+                safe_remove_file(audio_file, context="analyze")
         
         return result
     
     def _find_ffmpeg(self) -> Optional[str]:
-        """Find ffmpeg executable"""
-        # Check common locations
-        paths = ["ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
-        for path in paths:
-            try:
-                # Use multiprocessing to avoid fork issues
-                import platform
-                if platform.system() == "Darwin":
-                    # On macOS, use multiprocessing with spawn
-                    _ensure_spawn_method()  # Ensure spawn method is set before creating queue
-                    queue = None
-                    process_obj = None
-                    try:
-                        queue = multiprocessing.Queue()
-                        process_obj = multiprocessing.Process(
-                            target=_run_subprocess_worker,
-                            args=(queue, [path, "-version"], 2)
-                        )
-                        process_obj.start()
-                        process_obj.join(timeout=5)
-                        
-                        # Check if process timed out
-                        if process_obj.is_alive():
-                            # Process timed out - will be cleaned up in finally block
-                            continue
-                        
-                        # Get result from queue if available
-                        if not queue.empty():
-                            result = queue.get()
-                            if result.get('success') and result.get('returncode') == 0:
-                                return path
-                    finally:
-                        # Clean up resources - CRITICAL to prevent semaphore leaks
-                        # This handles both normal completion and timeout cases
-                        cleanup_multiprocessing_process(process_obj, context="_find_ffmpeg", timeout=2.0)
-                        cleanup_multiprocessing_queue(queue, context="_find_ffmpeg")
-                else:
-                    # On other platforms, subprocess is safe
-                    result = subprocess.run([path, "-version"], capture_output=True, timeout=2)
-                    if result.returncode == 0:
+        """Find ffmpeg executable without executing it"""
+        # First try shutil.which to find ffmpeg in PATH
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            if os.path.exists(ffmpeg_path) and os.access(ffmpeg_path, os.X_OK):
+                logger.info(f"_find_ffmpeg: found via PATH: {ffmpeg_path}")
+                return ffmpeg_path
+        
+        # Check common known locations
+        known_paths = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
+        for path in known_paths:
+            if os.path.exists(path) and os.access(path, os.X_OK):
+                logger.info(f"_find_ffmpeg: found at known location: {path}")
+                return path
+        
+        # Optional: validate with /usr/bin/file if available
+        # This is safer than running ffmpeg itself
+        for path in [ffmpeg_path] + known_paths if ffmpeg_path else known_paths:
+            if path and os.path.exists(path) and os.access(path, os.X_OK):
+                try:
+                    file_result = subprocess.run(
+                        ["/usr/bin/file", path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=1
+                    )
+                    if file_result.returncode == 0:
+                        file_type = file_result.stdout.decode('utf-8', errors='replace').strip()
+                        logger.debug(f"_find_ffmpeg: file type for {path}: {file_type}")
+                        # If file command succeeds, the path is valid
                         return path
-            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-                continue
+                except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+                    # /usr/bin/file not available or failed - that's OK, we already validated existence and exec
+                    pass
+        
+        logger.warning("_find_ffmpeg: ffmpeg not found in PATH or known locations")
         return None
     
     def _download_audio_sample(self, url: str) -> Optional[str]:
@@ -265,35 +256,43 @@ class AudioAnalyzer:
             import platform
             if platform.system() == "Darwin":
                 # On macOS, use multiprocessing with spawn to avoid fork crash
-                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
-                queue = multiprocessing.Queue()
-                process_obj = None
-                try:
-                    process_obj = multiprocessing.Process(
-                        target=_run_subprocess_worker,
-                        args=(queue, cmd, timeout)
-                    )
-                    process_obj.start()
-                    process_obj.join(timeout=timeout + 5)
-                    
-                    # Check if process timed out
-                    if process_obj.is_alive():
-                        # Process timed out - will be cleaned up in finally block
-                        raise subprocess.TimeoutExpired(cmd, timeout)
-                    
-                    # Get result from queue if available
-                    if not queue.empty():
-                        result = queue.get()
-                        process_returncode = result.get('returncode')
-                        process_stderr = result.get('stderr')
+                ok, result = run_process_with_queue(
+                    target=_run_subprocess_worker,
+                    args=(cmd, timeout),
+                    join_timeout=timeout + 5,
+                    get_timeout=0.5,
+                    name="_download_audio_sample"
+                )
+                
+                if not ok:
+                    # Check if result contains failure info (signal/crash)
+                    if result and isinstance(result, dict) and result.get('signal') is not None:
+                        signal_num = result.get('signal')
+                        signal_name = result.get('signal_name', f"signal {signal_num}")
+                        if signal_num == 11:  # SIGSEGV
+                            logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={result.get('exitcode')}")
+                        else:
+                            logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={result.get('exitcode')}")
+                        safe_remove_file(temp_path, context="_download_audio_sample")
+                        return None
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                
+                if not result:
+                    raise Exception("Subprocess result queue is empty")
+                
+                process_returncode = result.get('returncode')
+                process_stderr = result.get('stderr')
+                
+                # Check for signal crashes
+                if process_returncode is not None and process_returncode < 0:
+                    signal_num = -process_returncode
+                    if signal_num == 11:  # SIGSEGV
+                        logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={process_returncode}")
                     else:
-                        # Queue is empty - process may have crashed
-                        raise Exception("Subprocess result queue is empty")
-                finally:
-                    # Clean up resources - CRITICAL to prevent semaphore leaks
-                    # This handles both normal completion and timeout cases
-                    cleanup_multiprocessing_process(process_obj, context="_download_audio_sample", timeout=2.0)
-                    cleanup_multiprocessing_queue(queue, context="_download_audio_sample")
+                        signal_name = f"SIG{signal_num}"
+                        logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={process_returncode}")
+                    safe_remove_file(temp_path, context="_download_audio_sample")
+                    return None
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(
@@ -304,6 +303,17 @@ class AudioAnalyzer:
                 )
                 process_returncode = process.returncode
                 process_stderr = process.stderr
+                
+                # Check for signal crashes
+                if process_returncode is not None and process_returncode < 0:
+                    signal_num = -process_returncode
+                    if signal_num == 11:  # SIGSEGV
+                        logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={process_returncode}")
+                    else:
+                        signal_name = f"SIG{signal_num}"
+                        logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={process_returncode}")
+                    safe_remove_file(temp_path, context="_download_audio_sample")
+                    return None
             
             if process_returncode == 0 and os.path.exists(temp_path):
                 file_size = os.path.getsize(temp_path)
@@ -346,43 +356,53 @@ class AudioAnalyzer:
                 "-"  # Output to stdout
             ]
             
-            # Use multiprocessing with spawn on macOS to avoid fork issues
+            # Use Pipe-based multiprocessing on macOS to avoid Queue semaphore issues
             import platform
             if platform.system() == "Darwin":
-                # On macOS, use multiprocessing with spawn
-                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
-                queue = None
-                process_obj = None
-                try:
-                    queue = multiprocessing.Queue()
-                    process_obj = multiprocessing.Process(
-                        target=_run_subprocess_worker,
-                        args=(queue, cmd, 30)
-                    )
-                    process_obj.start()
-                    process_obj.join(timeout=35)
-                    
-                    # Check if process timed out
-                    if process_obj.is_alive():
-                        # Process timed out - will be cleaned up in finally block
-                        logger.error("ffmpeg conversion timeout")
+                # On macOS, use Pipe instead of Queue to avoid semaphore-backed IPC
+                ok, result = run_process_with_pipe(
+                    target=_run_subprocess_worker_pipe,
+                    args=(cmd, 30),
+                    join_timeout=35,
+                    name="_load_audio_raw"
+                )
+                
+                if not ok:
+                    # Check if result contains failure info (signal/crash)
+                    if result and isinstance(result, dict) and result.get('signal') is not None:
+                        signal_name = result.get('signal_name', f"signal {result.get('signal')}")
+                        signal_num = result.get('signal')
+                        logger.error(f"ffmpeg conversion crashed with {signal_name} (signal {signal_num}) in _load_audio_raw")
+                        
+                        # Fail immediately on SIGSEGV
+                        if signal_num == 11:  # SIGSEGV
+                            logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
+                            return None, 0, 0
+                        
+                        # For other signals, also fail
                         return None, 0, 0
                     
-                    # Get result from queue if available
-                    if not queue.empty():
-                        result = queue.get()
-                        process_returncode = result.get('returncode')
-                        process_stdout = result.get('stdout')
-                        process_stderr = result.get('stderr')
-                    else:
-                        # Queue is empty - process may have crashed
-                        logger.error("Subprocess result queue is empty")
+                    # Timeout or other failure
+                    logger.error("ffmpeg conversion timeout or failure in _load_audio_raw")
+                    return None, 0, 0
+                
+                if not result:
+                    logger.error("Subprocess result is empty in _load_audio_raw")
+                    return None, 0, 0
+                
+                # Check returncode for signals even if ok is True
+                process_returncode = result.get('returncode')
+                if process_returncode is not None and process_returncode < 0:
+                    signal_num = -process_returncode
+                    signal_name = 'SIGSEGV' if signal_num == 11 else f'SIG{signal_num}'
+                    logger.error(f"ffmpeg conversion crashed with {signal_name} (returncode={process_returncode}) in _load_audio_raw")
+                    if signal_num == 11:  # SIGSEGV
+                        logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
                         return None, 0, 0
-                finally:
-                    # Clean up resources - CRITICAL to prevent semaphore leaks
-                    # This handles both normal completion and timeout cases
-                    cleanup_multiprocessing_process(process_obj, context="_load_audio_raw", timeout=2.0)
-                    cleanup_multiprocessing_queue(queue, context="_load_audio_raw")
+                    return None, 0, 0
+                
+                process_stdout = result.get('stdout')
+                process_stderr = result.get('stderr')
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.run(

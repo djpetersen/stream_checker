@@ -11,47 +11,10 @@ import logging
 
 from stream_checker.utils.multiprocessing_utils import (
     cleanup_multiprocessing_queue,
-    cleanup_multiprocessing_process
+    cleanup_multiprocessing_process,
+    ensure_spawn_method,
+    run_process_with_queue
 )
-
-# Use spawn method on macOS to avoid fork issues
-# Defer setting until actually needed to avoid conflicts in Flask/multi-threaded environments
-_mp_start_method_set = False
-
-def _ensure_spawn_method():
-    """Ensure multiprocessing uses spawn method on macOS - call only when needed"""
-    global _mp_start_method_set
-    if _mp_start_method_set:
-        return
-    
-    if hasattr(multiprocessing, 'get_start_method'):
-        try:
-            if platform.system() != "Darwin":
-                _mp_start_method_set = True
-                return
-            
-            current_method = multiprocessing.get_start_method(allow_none=True)
-            if current_method is None:
-                # Not set yet, set it to spawn on macOS
-                try:
-                    multiprocessing.set_start_method('spawn')
-                    _mp_start_method_set = True
-                except RuntimeError:
-                    # Can't set - might already be set in another process
-                    pass
-            elif current_method == 'spawn':
-                _mp_start_method_set = True
-            else:
-                # Try to change it, but don't force (may fail in some contexts)
-                try:
-                    multiprocessing.set_start_method('spawn', force=True)
-                    _mp_start_method_set = True
-                except RuntimeError:
-                    # Already set or can't change - this is OK
-                    pass
-        except RuntimeError:
-            # Already set or can't change - this is OK
-            pass
 
 logger = logging.getLogger("stream_checker")
 
@@ -68,6 +31,9 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
     """Worker function for VLC subprocess - runs in separate process to avoid fork crash"""
     import time
     process = None
+    start_time = None
+    result = None
+    
     try:
         process = subprocess.Popen(
             cmd + [url],
@@ -83,13 +49,13 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
             stdout, stderr = process.communicate(timeout=total_timeout)
             return_code = process.returncode
             elapsed_time = time.time() - start_time
-            queue.put({
+            result = {
                 'success': True,
                 'returncode': return_code,
                 'stdout': stdout,
                 'stderr': stderr,
                 'elapsed_time': elapsed_time
-            })
+            }
         except subprocess.TimeoutExpired:
             # Try graceful termination first
             try:
@@ -97,38 +63,59 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
                 stdout, stderr = process.communicate(timeout=5)
                 return_code = process.returncode
                 elapsed_time = time.time() - start_time
-                queue.put({
+                result = {
                     'success': True,
                     'returncode': return_code,
                     'stdout': stdout,
                     'stderr': stderr,
                     'timeout': True,
                     'elapsed_time': elapsed_time
-                })
+                }
             except subprocess.TimeoutExpired:
                 # Force kill if terminate didn't work
                 process.kill()
                 process.wait()
                 elapsed_time = time.time() - start_time
-                queue.put({
+                result = {
                     'success': False,
                     'returncode': None,
                     'stdout': None,
                     'stderr': None,
                     'error': 'timeout',
                     'elapsed_time': elapsed_time
-                })
+                }
     except Exception as e:
-        elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
-        queue.put({
+        elapsed_time = time.time() - start_time if start_time else 0
+        result = {
             'success': False,
             'returncode': None,
             'stdout': None,
             'stderr': None,
             'error': str(e),
             'elapsed_time': elapsed_time
-        })
+        }
     finally:
+        # Always try to put result in queue, even if it's None
+        try:
+            if result is not None:
+                queue.put(result)
+            else:
+                # Fallback if result was never set
+                elapsed_time = time.time() - start_time if start_time else 0
+                queue.put({
+                    'success': False,
+                    'returncode': None,
+                    'stdout': None,
+                    'stderr': None,
+                    'error': 'Unknown error in VLC worker',
+                    'elapsed_time': elapsed_time
+                })
+        except Exception as e:
+            # If queue.put fails (e.g., queue is closed), we can't do anything
+            # The parent will timeout and clean up
+            logger.debug(f"Error putting result in queue in _run_vlc_worker: {e}")
+        
+        # Clean up process if still running
         if process and process.poll() is None:
             try:
                 process.terminate()
@@ -158,6 +145,9 @@ class PlayerTester:
         self.connection_timeout = connection_timeout
         self.vlc_instance = None
         self.media_player = None
+        self._current_media = None  # Track media object for explicit cleanup
+        self._event_manager = None  # Track event manager to detach callbacks
+        self._callbacks_detached = False  # Flag to prevent callback access after release
         self._playback_errors = []
         self._connection_time = None
         self._buffering_events = 0
@@ -209,11 +199,11 @@ class PlayerTester:
                 return result
             
             # Set up event callbacks
-            event_manager = self.media_player.event_manager()
-            event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, self._on_playing)
-            event_manager.event_attach(vlc.EventType.MediaPlayerBuffering, self._on_buffering)
-            event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_error)
-            event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_end)
+            self._event_manager = self.media_player.event_manager()
+            self._event_manager.event_attach(vlc.EventType.MediaPlayerPlaying, self._on_playing)
+            self._event_manager.event_attach(vlc.EventType.MediaPlayerBuffering, self._on_buffering)
+            self._event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_error)
+            self._event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_end)
             
             # Create media object
             media = self.vlc_instance.media_new(url)
@@ -221,6 +211,9 @@ class PlayerTester:
                 result["status"] = "error"
                 result["errors"].append("Failed to create media object")
                 return result
+            
+            # Store media reference for explicit cleanup
+            self._current_media = media
             
             # Start playback
             start_time = time.time()
@@ -233,7 +226,14 @@ class PlayerTester:
             waited = 0
             
             while waited < max_wait:
-                state = self.media_player.get_state()
+                # Defensive check - media_player might be released by callback
+                if not self.media_player or self._callbacks_detached:
+                    break
+                try:
+                    state = self.media_player.get_state()
+                except (AttributeError, RuntimeError, Exception):
+                    # Media player may have been released
+                    break
                 
                 if state == vlc.State.Playing:
                     self._connection_time = (time.time() - connection_start) * 1000
@@ -259,13 +259,21 @@ class PlayerTester:
                 result["status"] = "timeout"
                 result["errors"].append(f"Connection timeout after {self.connection_timeout} seconds")
                 result["error_details"] = f"Stream did not start playing within {self.connection_timeout} seconds"
-                self.media_player.stop()
+                if self.media_player:
+                    self.media_player.stop()
                 return result
             
             # Play for specified duration
             playback_start = time.time()
             while (time.time() - playback_start) < self.playback_duration:
-                state = self.media_player.get_state()
+                # Defensive check - media_player might be released by callback
+                if not self.media_player or self._callbacks_detached:
+                    break
+                try:
+                    state = self.media_player.get_state()
+                except (AttributeError, RuntimeError, Exception):
+                    # Media player may have been released
+                    break
                 
                 if state == vlc.State.Error:
                     result["status"] = "error"
@@ -287,12 +295,41 @@ class PlayerTester:
             result["playback_duration_seconds"] = round(actual_duration, 2)
             result["buffering_events"] = self._buffering_events
             
-            # Stop playback
-            self.media_player.stop()
+            # Detach callbacks BEFORE stopping/releasing to prevent async callback crashes
+            if self._event_manager and not self._callbacks_detached:
+                try:
+                    self._event_manager.event_detach(vlc.EventType.MediaPlayerPlaying)
+                    self._event_manager.event_detach(vlc.EventType.MediaPlayerBuffering)
+                    self._event_manager.event_detach(vlc.EventType.MediaPlayerEncounteredError)
+                    self._event_manager.event_detach(vlc.EventType.MediaPlayerEndReached)
+                except Exception:
+                    pass  # Ignore errors during detach
+                self._callbacks_detached = True
+                self._event_manager = None
             
-            # Clean up
-            self.media_player.release()
-            self.vlc_instance.release()
+            # Stop playback
+            if self.media_player:
+                try:
+                    self.media_player.stop()
+                except Exception:
+                    pass  # Ignore errors during stop
+            
+            # Clean up - set to None after release to prevent double-free in finally block
+            if self.media_player:
+                try:
+                    self.media_player.release()
+                except Exception:
+                    pass  # Ignore errors during release
+                self.media_player = None
+            if self._current_media:
+                try:
+                    self._current_media.release()
+                except Exception:
+                    pass  # Media may already be released by player
+                self._current_media = None
+            if self.vlc_instance:
+                self.vlc_instance.release()
+                self.vlc_instance = None
             
         except vlc.VLCException as e:
             result["status"] = "error"
@@ -307,13 +344,42 @@ class PlayerTester:
             logger.error(f"Player test error: {e}")
         
         finally:
-            # Ensure cleanup
+            # Ensure cleanup - set to None after release to prevent any double-free issues
             try:
+                # Detach callbacks first to prevent async callback crashes
+                if self._event_manager and not self._callbacks_detached:
+                    try:
+                        self._event_manager.event_detach(vlc.EventType.MediaPlayerPlaying)
+                        self._event_manager.event_detach(vlc.EventType.MediaPlayerBuffering)
+                        self._event_manager.event_detach(vlc.EventType.MediaPlayerEncounteredError)
+                        self._event_manager.event_detach(vlc.EventType.MediaPlayerEndReached)
+                    except Exception:
+                        pass  # Ignore errors during detach
+                    self._callbacks_detached = True
+                    self._event_manager = None
+                
                 if self.media_player:
-                    self.media_player.stop()
-                    self.media_player.release()
+                    try:
+                        self.media_player.stop()
+                    except Exception:
+                        pass  # Ignore errors during stop
+                    try:
+                        self.media_player.release()
+                    except Exception:
+                        pass  # Ignore errors during release
+                    self.media_player = None
+                if self._current_media:
+                    try:
+                        self._current_media.release()
+                    except Exception:
+                        pass  # Media may already be released by player
+                    self._current_media = None
                 if self.vlc_instance:
-                    self.vlc_instance.release()
+                    try:
+                        self.vlc_instance.release()
+                    except Exception:
+                        pass  # Ignore errors during release
+                    self.vlc_instance = None
             except Exception as e:
                 logger.debug(f"Error during VLC cleanup: {e}")
         
@@ -321,27 +387,48 @@ class PlayerTester:
     
     def _on_playing(self, event):
         """Callback when playback starts"""
-        # Note: VLC callbacks are called from VLC's thread, but VLC handles thread safety
-        # These callbacks are typically single-threaded per instance
-        self._playback_started = True
-        logger.debug("VLC playback started")
+        # Defensive check - don't access if callbacks are detached
+        if self._callbacks_detached:
+            return
+        try:
+            self._playback_started = True
+            logger.debug("VLC playback started")
+        except Exception:
+            pass  # Ignore errors in callback
     
     def _on_buffering(self, event):
         """Callback when buffering occurs"""
-        # Note: VLC callbacks are thread-safe within VLC's context
-        self._buffering_events += 1
-        logger.debug(f"VLC buffering event #{self._buffering_events}")
+        # Defensive check - don't access if callbacks are detached
+        if self._callbacks_detached:
+            return
+        try:
+            self._buffering_events += 1
+            logger.debug(f"VLC buffering event #{self._buffering_events}")
+        except Exception:
+            pass  # Ignore errors in callback
     
     def _on_error(self, event):
         """Callback when error occurs"""
-        error_msg = "VLC playback error"
-        self._playback_errors.append(error_msg)
-        logger.error(f"VLC error: {error_msg}")
+        # Defensive check - don't access if callbacks are detached
+        if self._callbacks_detached:
+            return
+        try:
+            error_msg = "VLC playback error"
+            self._playback_errors.append(error_msg)
+            logger.error(f"VLC error: {error_msg}")
+        except Exception:
+            pass  # Ignore errors in callback
     
     def _on_end(self, event):
         """Callback when playback ends"""
-        self._playback_completed = True
-        logger.debug("VLC playback ended")
+        # Defensive check - don't access if callbacks are detached
+        if self._callbacks_detached:
+            return
+        try:
+            self._playback_completed = True
+            logger.debug("VLC playback ended")
+        except Exception:
+            pass  # Ignore errors in callback
 
 
 class PlayerTesterFallback:
@@ -378,32 +465,17 @@ class PlayerTesterFallback:
             try:
                 if platform.system() == "Darwin":
                     from stream_checker.core.audio_analysis import _run_subprocess_worker
-                    import queue as queue_module
-                    mp_queue = None
-                    process_obj = None
-                    try:
-                        mp_queue = multiprocessing.Queue()
-                        process_obj = multiprocessing.Process(
-                            target=_run_subprocess_worker,
-                            args=(mp_queue, ["which", "vlc"], 2)
-                        )
-                        process_obj.start()
-                        process_obj.join(timeout=5)
-                        
-                        # Check if process timed out
-                        if process_obj.is_alive():
-                            # Process timed out - will be cleaned up in finally block
-                            pass
-                        elif not mp_queue.empty():
-                            result = mp_queue.get()
-                            if result.get('success') and result.get('returncode') == 0:
-                                vlc_path = result.get('stdout').decode().strip() if result.get('stdout') else None
-                                if vlc_path:
-                                    paths.insert(0, vlc_path)
-                    finally:
-                        # Clean up resources - CRITICAL to prevent semaphore leaks
-                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command.which", timeout=2.0)
-                        cleanup_multiprocessing_queue(mp_queue, context="_find_vlc_command.which")
+                    ok, result = run_process_with_queue(
+                        target=_run_subprocess_worker,
+                        args=(["which", "vlc"], 2),
+                        join_timeout=5,
+                        get_timeout=0.5,
+                        name="_find_vlc_command.which"
+                    )
+                    if ok and result and result.get('success') and result.get('returncode') == 0:
+                        vlc_path = result.get('stdout').decode().strip() if result.get('stdout') else None
+                        if vlc_path:
+                            paths.insert(0, vlc_path)
                 else:
                     which_result = subprocess.run(["which", "vlc"], capture_output=True, timeout=2)
                     if which_result.returncode == 0:
@@ -427,34 +499,16 @@ class PlayerTesterFallback:
             try:
                 if system == "Darwin":
                     # On macOS, use multiprocessing to avoid fork crash
-                    _ensure_spawn_method()  # Ensure spawn method is set before creating queue
                     from stream_checker.core.audio_analysis import _run_subprocess_worker
-                    mp_queue = None
-                    process_obj = None
-                    try:
-                        mp_queue = multiprocessing.Queue()
-                        process_obj = multiprocessing.Process(
-                            target=_run_subprocess_worker,
-                            args=(mp_queue, [path, "--version"], 5)
-                        )
-                        process_obj.start()
-                        process_obj.join(timeout=7)
-                        
-                        # Check if process timed out
-                        if process_obj.is_alive():
-                            # Process timed out - will be cleaned up in finally block
-                            continue
-                        
-                        # Get result from queue if available
-                        if not mp_queue.empty():
-                            result = mp_queue.get()
-                            if result.get('success') and result.get('returncode') == 0:
-                                return path
-                    finally:
-                        # Clean up resources - CRITICAL to prevent semaphore leaks
-                        # This handles both normal completion and timeout cases
-                        cleanup_multiprocessing_process(process_obj, context="_find_vlc_command", timeout=2.0)
-                        cleanup_multiprocessing_queue(mp_queue, context="_find_vlc_command")
+                    ok, result = run_process_with_queue(
+                        target=_run_subprocess_worker,
+                        args=([path, "--version"], 5),
+                        join_timeout=7,
+                        get_timeout=0.5,
+                        name="_find_vlc_command"
+                    )
+                    if ok and result and result.get('success') and result.get('returncode') == 0:
+                        return path
                 else:
                     result = subprocess.run(
                         [path, "--version"],
@@ -497,7 +551,6 @@ class PlayerTesterFallback:
             # On other platforms, subprocess is safe
             if platform.system() == "Darwin":
                 # Use multiprocessing for VLC on macOS
-                _ensure_spawn_method()  # Ensure spawn method is set before creating queue
                 vlc_cmd_list = [
                     vlc_cmd,
                     "--intf", "dummy",
@@ -507,59 +560,44 @@ class PlayerTesterFallback:
                     "--network-caching=3000"
                 ]
                 
-                mp_queue = None
-                process_obj = None
-                try:
-                    mp_queue = multiprocessing.Queue()
-                    process_obj = multiprocessing.Process(
-                        target=_run_vlc_worker,
-                        args=(mp_queue, vlc_cmd_list, url, self.playback_duration, total_timeout)
-                    )
-                    process_obj.start()
-                    process_obj.join(timeout=total_timeout + 10)
-                    
-                    # Check if process timed out
-                    if process_obj.is_alive():
-                        # Process timed out - will be cleaned up in finally block
-                        result["status"] = "error"
+                ok, vlc_result = run_process_with_queue(
+                    target=_run_vlc_worker,
+                    args=(vlc_cmd_list, url, self.playback_duration, total_timeout),
+                    join_timeout=total_timeout + 10,
+                    get_timeout=0.5,
+                    name="PlayerTesterFallback.check"
+                )
+                
+                if not ok or not vlc_result:
+                    result["status"] = "error"
+                    if not ok:
                         result["errors"].append("VLC process timeout")
-                        return result
-                    
-                    # Get result from queue if available
-                    if not mp_queue.empty():
-                        vlc_result = mp_queue.get()
-                        return_code = vlc_result.get('returncode')
                     else:
-                        # Queue is empty - process may have crashed
-                        result["status"] = "error"
                         result["errors"].append("VLC process result queue is empty")
-                        return result
-                    stdout = vlc_result.get('stdout')
-                    stderr = vlc_result.get('stderr')
-                    elapsed_time = vlc_result.get('elapsed_time', 0)
-                    
-                    result["playback_duration_seconds"] = round(elapsed_time, 2)
-                    
-                    # Check return code
-                    if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
-                        result["status"] = "success"
-                        result["format_supported"] = True
-                        # Estimate connection time (first 20% of total time, max 5 seconds)
-                        connection_time = min(elapsed_time * 0.2, 5.0)
-                        result["connection_time_ms"] = int(connection_time * 1000)
-                    else:
-                        result["status"] = "error"
-                        if return_code != -15:  # Don't add error for SIGTERM
-                            result["errors"].append(f"VLC returned error code {return_code}")
-                        if stderr:
-                            error_text = stderr.decode('utf-8', errors='ignore')
-                            if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
-                                result["error_details"] = error_text[:500]  # Limit error text
-                finally:
-                    # Clean up resources - CRITICAL to prevent semaphore leaks
-                    # This handles both normal completion and timeout cases
-                    cleanup_multiprocessing_process(process_obj, context="PlayerTesterFallback.check", timeout=2.0)
-                    cleanup_multiprocessing_queue(mp_queue, context="PlayerTesterFallback.check")
+                    return result
+                
+                return_code = vlc_result.get('returncode')
+                stdout = vlc_result.get('stdout')
+                stderr = vlc_result.get('stderr')
+                elapsed_time = vlc_result.get('elapsed_time', 0)
+                
+                result["playback_duration_seconds"] = round(elapsed_time, 2)
+                
+                # Check return code
+                if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
+                    result["status"] = "success"
+                    result["format_supported"] = True
+                    # Estimate connection time (first 20% of total time, max 5 seconds)
+                    connection_time = min(elapsed_time * 0.2, 5.0)
+                    result["connection_time_ms"] = int(connection_time * 1000)
+                else:
+                    result["status"] = "error"
+                    if return_code != -15:  # Don't add error for SIGTERM
+                        result["errors"].append(f"VLC returned error code {return_code}")
+                    if stderr:
+                        error_text = stderr.decode('utf-8', errors='ignore')
+                        if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
+                            result["error_details"] = error_text[:500]  # Limit error text
             else:
                 # On other platforms, subprocess is safe
                 process = subprocess.Popen(
