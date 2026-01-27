@@ -6,6 +6,8 @@ import logging
 from typing import Optional, Tuple, Any, Callable
 import queue as queue_module
 
+from stream_checker.utils.subprocess_utils import run_subprocess_safe
+
 logger = logging.getLogger("stream_checker")
 
 # Multiprocessing timeout constants
@@ -307,46 +309,33 @@ def run_process_with_queue(
 
 
 def _run_subprocess_worker_pipe(conn, cmd, timeout):
-    """Worker function for multiprocessing using Pipe - must be at module level for pickling"""
-    result = None
+    """Worker function for multiprocessing using Pipe - must be at module level for pickling.
+    Routes through run_subprocess_safe for improved stability on macOS.
+    """
+    # Route through run_subprocess_safe for improved stability on macOS
+    result = run_subprocess_safe(
+        cmd,
+        timeout=timeout,
+        text=False
+    )
+    # Return in the same format as before for compatibility
+    result_dict = {
+        'success': result.get('success', False),
+        'returncode': result.get('returncode'),
+        'stdout': result.get('stdout'),
+        'stderr': result.get('stderr')
+    }
+    # Include error if present
+    if result.get('error'):
+        result_dict['error'] = result.get('error')
+    
+    # Send result through pipe
     try:
-        import subprocess
-        process = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout
-        )
-        result = {
-            'success': True,
-            'returncode': process.returncode,
-            'stdout': process.stdout,
-            'stderr': process.stderr
-        }
-    except subprocess.TimeoutExpired as e:
-        result = {
-            'success': False,
-            'returncode': None,
-            'stdout': None,
-            'stderr': e.stderr if hasattr(e, 'stderr') else None,
-            'error': 'timeout'
-        }
-    except Exception as e:
-        result = {
-            'success': False,
-            'returncode': None,
-            'stdout': None,
-            'stderr': None,
-            'error': str(e)
-        }
+        conn.send(result_dict)
+    except Exception:
+        pass
     finally:
-        # Send result through pipe
-        try:
-            conn.send(result)
-        except Exception:
-            pass
-        finally:
-            conn.close()
+        conn.close()
 
 
 def run_process_with_pipe(

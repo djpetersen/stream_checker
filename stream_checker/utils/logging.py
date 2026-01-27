@@ -39,17 +39,21 @@ def setup_logging(
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
         
-        file_handler = RotatingFileHandler(
-            log_path,
-            maxBytes=max_file_size_mb * 1024 * 1024,
-            backupCount=backup_count
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_format = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_format)
-        logger.addHandler(file_handler)
+        try:
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=max_file_size_mb * 1024 * 1024,
+                backupCount=backup_count
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_format = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_format)
+            logger.addHandler(file_handler)
+        except (PermissionError, OSError) as e:
+            # Log permission errors to console but continue without file logging
+            logger.warning(f"Could not create log file at {log_path}: {e}. Continuing with console logging only.")
     
     return logger

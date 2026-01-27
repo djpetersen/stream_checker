@@ -5,6 +5,18 @@ Main CLI entry point
 """
 
 import sys
+import platform
+
+# CRITICAL: Set multiprocessing start method to 'spawn' on macOS BEFORE any other imports
+# This prevents fork crashes in multi-threaded processes when subprocess is used
+if platform.system() == "Darwin":
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set - that's OK
+        pass
+
 import argparse
 import json
 import logging

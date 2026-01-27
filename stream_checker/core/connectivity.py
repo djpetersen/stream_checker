@@ -69,13 +69,36 @@ class ConnectivityChecker:
             # Connection timeout, SSL error, etc. - can't proceed
             return result
         
+        # Check for redirect to non-stream content (HTML page)
+        final_url = connectivity_result.get("final_url")
+        content_type = connectivity_result.get("content_type", "").lower()
+        is_redirect_to_html = False
+        if final_url and final_url != url:
+            # Only flag as HTML redirect if content_type is actually text/html
+            # CDN redirects (same domain, different subdomain) are normal and should not be flagged
+            if "text/html" in content_type:
+                is_redirect_to_html = True
+                logger.warning(f"URL redirected to non-stream content: {url} -> {final_url} (content-type: {content_type})")
+        
         # Check SSL certificate (if HTTPS)
         if url.startswith("https://"):
             ssl_result = self._check_ssl_certificate(url)
             result["ssl_certificate"] = ssl_result
         
-        # Extract stream parameters and metadata
-        params_result = self._extract_stream_parameters(url)
+        # Extract stream parameters and metadata (skip if redirected to HTML)
+        if is_redirect_to_html or "text/html" in content_type:
+            logger.debug("Skipping parameter extraction - redirected to HTML page or content-type is text/html")
+            params_result = {
+                "bitrate_kbps": None,
+                "codec": None,
+                "sample_rate_hz": None,
+                "channels": None,
+                "container": None,
+                "container_format": None,
+                "bitrate_mode": None
+            }
+        else:
+            params_result = self._extract_stream_parameters(url)
         result["stream_parameters"] = params_result
         
         metadata_result = self._extract_metadata(url)
@@ -85,8 +108,8 @@ class ConnectivityChecker:
         headers_result = self._analyze_headers(url)
         result["server_headers"] = headers_result
         
-        # Detect stream type
-        stream_type_result = self._detect_stream_type(url, connectivity_result, headers_result)
+        # Detect stream type (pass redirect info)
+        stream_type_result = self._detect_stream_type(url, connectivity_result, headers_result, is_redirect_to_html=is_redirect_to_html)
         result["stream_type"] = stream_type_result
         
         # Check HLS if applicable
@@ -690,6 +713,57 @@ class ConnectivityChecker:
             if "Access-Control-Allow-Origin" in headers:
                 headers_info["cors_enabled"] = True
                 headers_info["cors_origin"] = headers.get("Access-Control-Allow-Origin")
+            
+            # Detect CDN information
+            cdn_info = {}
+            
+            # Cloudflare
+            if "CF-Ray" in headers:
+                cdn_info["provider"] = "Cloudflare"
+                cdn_info["cf_ray"] = headers.get("CF-Ray")
+                cdn_info["cf_country"] = headers.get("CF-IPCountry")
+                cdn_info["cf_visitor"] = headers.get("CF-Visitor")
+            
+            # AWS CloudFront
+            elif "X-Amz-Cf-Id" in headers:
+                cdn_info["provider"] = "AWS CloudFront"
+                cdn_info["cf_id"] = headers.get("X-Amz-Cf-Id")
+                cdn_info["via"] = headers.get("Via")
+            
+            # Fastly
+            elif "X-Served-By" in headers or "X-Cache" in headers:
+                cdn_info["provider"] = "Fastly"
+                cdn_info["served_by"] = headers.get("X-Served-By")
+                cdn_info["cache"] = headers.get("X-Cache")
+                cdn_info["cache_hits"] = headers.get("X-Cache-Hits")
+            
+            # Akamai
+            elif "X-Akamai-Request-ID" in headers or "Server" in headers and "Akamai" in headers.get("Server", ""):
+                cdn_info["provider"] = "Akamai"
+                cdn_info["request_id"] = headers.get("X-Akamai-Request-ID")
+                cdn_info["server"] = headers.get("Server")
+            
+            # Generic CDN detection via Via header
+            elif "Via" in headers:
+                via_header = headers.get("Via", "").lower()
+                if "cloudflare" in via_header:
+                    cdn_info["provider"] = "Cloudflare"
+                elif "cloudfront" in via_header or "amazon" in via_header:
+                    cdn_info["provider"] = "AWS CloudFront"
+                elif "fastly" in via_header:
+                    cdn_info["provider"] = "Fastly"
+                elif "akamai" in via_header:
+                    cdn_info["provider"] = "Akamai"
+                else:
+                    cdn_info["provider"] = "Unknown CDN"
+                cdn_info["via"] = headers.get("Via")
+            
+            # X-CDN header (generic)
+            if "X-CDN" in headers:
+                cdn_info["provider"] = headers.get("X-CDN")
+            
+            if cdn_info:
+                headers_info["cdn"] = cdn_info
         
         except Exception as e:
             headers_info["error"] = str(e)
@@ -703,13 +777,14 @@ class ConnectivityChecker:
         
         return headers_info
     
-    def _detect_stream_type(self, url: str, connectivity_result: Dict[str, Any], headers_result: Dict[str, Any]) -> Dict[str, Any]:
+    def _detect_stream_type(self, url: str, connectivity_result: Dict[str, Any], headers_result: Dict[str, Any], is_redirect_to_html: bool = False) -> Dict[str, Any]:
         """Detect and identify the stream type/protocol
         
         Args:
             url: Stream URL
             connectivity_result: Results from connectivity check
             headers_result: Results from header analysis
+            is_redirect_to_html: Whether URL redirected to HTML page
             
         Returns:
             Dictionary with stream type information
@@ -722,6 +797,18 @@ class ConnectivityChecker:
         }
         
         try:
+            # Check for redirect to non-stream content first
+            final_url = connectivity_result.get("final_url")
+            content_type = connectivity_result.get("content_type", "").lower() if connectivity_result else ""
+            
+            if is_redirect_to_html or (final_url and final_url != url and "text/html" in content_type):
+                stream_type["type"] = "Redirect to Web Page"
+                stream_type["detected_via"] = ["redirect_detection"]
+                stream_type["confidence"] = "high"
+                stream_type["redirect_url"] = final_url
+                stream_type["error"] = "URL redirected to web page instead of audio stream"
+                return stream_type
+            
             # Check for HLS first (most specific)
             if self._is_hls(url):
                 stream_type["type"] = "HLS"

@@ -9,15 +9,8 @@ import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import logging
 
-from stream_checker.utils.multiprocessing_utils import (
-    cleanup_multiprocessing_queue,
-    cleanup_multiprocessing_process,
-    ensure_spawn_method,
-    run_process_with_queue,
-    run_process_with_pipe,
-    _run_subprocess_worker_pipe
-)
 from stream_checker.utils.file_utils import safe_remove_file
+from stream_checker.utils.subprocess_utils import run_subprocess_safe
 
 logger = logging.getLogger("stream_checker")
 
@@ -26,36 +19,22 @@ def _run_subprocess_safe(cmd, timeout, stdout, stderr):
     """
     Run subprocess in a spawned process to avoid fork issues on macOS.
     This function runs in a separate process and returns the result via a queue.
+    Routes through run_subprocess_safe for improved stability on macOS.
     """
-    try:
-        process = subprocess.run(
-            cmd,
-            stdout=stdout,
-            stderr=stderr,
-            timeout=timeout
-        )
-        return {
-            'returncode': process.returncode,
-            'stdout': process.stdout,
-            'stderr': process.stderr,
-            'success': True
-        }
-    except subprocess.TimeoutExpired as e:
-        return {
-            'returncode': None,
-            'stdout': None,
-            'stderr': e.stderr if hasattr(e, 'stderr') else None,
-            'success': False,
-            'error': 'timeout'
-        }
-    except Exception as e:
-        return {
-            'returncode': None,
-            'stdout': None,
-            'stderr': None,
-            'success': False,
-            'error': str(e)
-        }
+    # Route through run_subprocess_safe (stdout/stderr params ignored, always uses PIPE)
+    result = run_subprocess_safe(
+        cmd,
+        timeout=timeout,
+        text=False
+    )
+    # Return in the same format as before for compatibility
+    return {
+        'returncode': result.get('returncode'),
+        'stdout': result.get('stdout'),
+        'stderr': result.get('stderr'),
+        'success': result.get('success', False),
+        'error': result.get('error')
+    }
 
 
 def _run_subprocess_worker(queue, cmd, timeout):
@@ -207,18 +186,18 @@ class AudioAnalyzer:
         for path in [ffmpeg_path] + known_paths if ffmpeg_path else known_paths:
             if path and os.path.exists(path) and os.access(path, os.X_OK):
                 try:
-                    file_result = subprocess.run(
+                    file_result = run_subprocess_safe(
                         ["/usr/bin/file", path],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=1
+                        timeout=1.0,
+                        text=False
                     )
-                    if file_result.returncode == 0:
-                        file_type = file_result.stdout.decode('utf-8', errors='replace').strip()
-                        logger.debug(f"_find_ffmpeg: file type for {path}: {file_type}")
-                        # If file command succeeds, the path is valid
-                        return path
-                except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+                    if file_result.get('success') and file_result.get('returncode') == 0:
+                        file_type = file_result.get('stdout').decode('utf-8', errors='replace').strip() if file_result.get('stdout') else None
+                        if file_type:
+                            logger.debug(f"_find_ffmpeg: file type for {path}: {file_type}")
+                            # If file command succeeds, the path is valid
+                            return path
+                except (FileNotFoundError, Exception):
                     # /usr/bin/file not available or failed - that's OK, we already validated existence and exec
                     pass
         
@@ -250,70 +229,37 @@ class AudioAnalyzer:
                 temp_path
             ]
             
-            # Run ffmpeg with timeout
-            # Use multiprocessing with spawn on macOS to avoid fork issues
+            # Run ffmpeg with timeout - use run_subprocess_safe to avoid fork crashes on macOS
             timeout = self.sample_duration + 30  # Add buffer
-            import platform
-            if platform.system() == "Darwin":
-                # On macOS, use multiprocessing with spawn to avoid fork crash
-                ok, result = run_process_with_queue(
-                    target=_run_subprocess_worker,
-                    args=(cmd, timeout),
-                    join_timeout=timeout + 5,
-                    get_timeout=0.5,
-                    name="_download_audio_sample"
-                )
-                
-                if not ok:
-                    # Check if result contains failure info (signal/crash)
-                    if result and isinstance(result, dict) and result.get('signal') is not None:
-                        signal_num = result.get('signal')
-                        signal_name = result.get('signal_name', f"signal {signal_num}")
-                        if signal_num == 11:  # SIGSEGV
-                            logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={result.get('exitcode')}")
-                        else:
-                            logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={result.get('exitcode')}")
-                        safe_remove_file(temp_path, context="_download_audio_sample")
-                        return None
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-                
-                if not result:
-                    raise Exception("Subprocess result queue is empty")
-                
-                process_returncode = result.get('returncode')
-                process_stderr = result.get('stderr')
-                
-                # Check for signal crashes
-                if process_returncode is not None and process_returncode < 0:
-                    signal_num = -process_returncode
-                    if signal_num == 11:  # SIGSEGV
-                        logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={process_returncode}")
-                    else:
-                        signal_name = f"SIG{signal_num}"
-                        logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={process_returncode}")
-                    safe_remove_file(temp_path, context="_download_audio_sample")
-                    return None
-            else:
-                # On other platforms, subprocess is safe
-                process = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout
-                )
-                process_returncode = process.returncode
-                process_stderr = process.stderr
-                
-                # Check for signal crashes
-                if process_returncode is not None and process_returncode < 0:
-                    signal_num = -process_returncode
-                    if signal_num == 11:  # SIGSEGV
-                        logger.error(f"ffmpeg binary crashed with SIGSEGV (signal 11) in _download_audio_sample, exitcode={process_returncode}")
-                    else:
-                        signal_name = f"SIG{signal_num}"
-                        logger.error(f"ffmpeg crashed with {signal_name} (signal {signal_num}) in _download_audio_sample, exitcode={process_returncode}")
-                    safe_remove_file(temp_path, context="_download_audio_sample")
-                    return None
+            result = run_subprocess_safe(
+                cmd,
+                timeout=timeout,
+                text=False
+            )
+            
+            process_returncode = result.get('returncode')
+            process_stderr = result.get('stderr')
+            
+            # Check for signal crashes (handled by run_subprocess_safe)
+            if result.get('is_signal_kill'):
+                signal_num = result.get('signal_num')
+                signal_name = result.get('signal_name', f'SIG{signal_num}')
+                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
+                logger.error(f"ffmpeg binary crashed with {signal_name} (signal {signal_num}, exitcode={process_returncode}) in _download_audio_sample")
+                logger.error(f"ffmpeg argv: {cmd}, cwd: {os.getcwd()}, stderr: {error_msg[:500]}")
+                safe_remove_file(temp_path, context="_download_audio_sample")
+                return None
+            
+            # Check for subprocess.run() exceptions (timeout, etc.)
+            if not result.get('success', False):
+                error_msg = result.get('error', 'Unknown error')
+                if 'timeout' in error_msg.lower():
+                    logger.error("ffmpeg timeout")
+                else:
+                    stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
+                    logger.error(f"ffmpeg failed: {error_msg}, stderr: {stderr_msg[:500]}")
+                safe_remove_file(temp_path, context="_download_audio_sample")
+                return None
             
             if process_returncode == 0 and os.path.exists(temp_path):
                 file_size = os.path.getsize(temp_path)
@@ -329,10 +275,6 @@ class AudioAnalyzer:
                 safe_remove_file(temp_path, context="_download_audio_sample")
                 return None
         
-        except subprocess.TimeoutExpired:
-            logger.error("ffmpeg timeout")
-            safe_remove_file(temp_path, context="_download_audio_sample")
-            return None
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             safe_remove_file(temp_path, context="_download_audio_sample")
@@ -356,64 +298,34 @@ class AudioAnalyzer:
                 "-"  # Output to stdout
             ]
             
-            # Use Pipe-based multiprocessing on macOS to avoid Queue semaphore issues
-            import platform
-            if platform.system() == "Darwin":
-                # On macOS, use Pipe instead of Queue to avoid semaphore-backed IPC
-                ok, result = run_process_with_pipe(
-                    target=_run_subprocess_worker_pipe,
-                    args=(cmd, 30),
-                    join_timeout=35,
-                    name="_load_audio_raw"
-                )
-                
-                if not ok:
-                    # Check if result contains failure info (signal/crash)
-                    if result and isinstance(result, dict) and result.get('signal') is not None:
-                        signal_name = result.get('signal_name', f"signal {result.get('signal')}")
-                        signal_num = result.get('signal')
-                        logger.error(f"ffmpeg conversion crashed with {signal_name} (signal {signal_num}) in _load_audio_raw")
-                        
-                        # Fail immediately on SIGSEGV
-                        if signal_num == 11:  # SIGSEGV
-                            logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
-                            return None, 0, 0
-                        
-                        # For other signals, also fail
-                        return None, 0, 0
-                    
-                    # Timeout or other failure
-                    logger.error("ffmpeg conversion timeout or failure in _load_audio_raw")
-                    return None, 0, 0
-                
-                if not result:
-                    logger.error("Subprocess result is empty in _load_audio_raw")
-                    return None, 0, 0
-                
-                # Check returncode for signals even if ok is True
-                process_returncode = result.get('returncode')
-                if process_returncode is not None and process_returncode < 0:
-                    signal_num = -process_returncode
-                    signal_name = 'SIGSEGV' if signal_num == 11 else f'SIG{signal_num}'
-                    logger.error(f"ffmpeg conversion crashed with {signal_name} (returncode={process_returncode}) in _load_audio_raw")
-                    if signal_num == 11:  # SIGSEGV
-                        logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
-                        return None, 0, 0
-                    return None, 0, 0
-                
-                process_stdout = result.get('stdout')
-                process_stderr = result.get('stderr')
-            else:
-                # On other platforms, subprocess is safe
-                process = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=30
-                )
-                process_returncode = process.returncode
-                process_stdout = process.stdout
-                process_stderr = process.stderr
+            # Use run_subprocess_safe to avoid fork crashes on macOS
+            result = run_subprocess_safe(
+                cmd,
+                timeout=30,
+                text=False
+            )
+            
+            process_returncode = result.get('returncode')
+            process_stdout = result.get('stdout')
+            process_stderr = result.get('stderr')
+            
+            # Check for signal crashes (handled by run_subprocess_safe)
+            if result.get('is_signal_kill'):
+                signal_num = result.get('signal_num')
+                signal_name = result.get('signal_name', f'SIG{signal_num}')
+                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
+                logger.error(f"ffmpeg conversion crashed with {signal_name} (signal {signal_num}, exitcode={process_returncode}) in _load_audio_raw")
+                logger.error(f"ffmpeg argv: {cmd}, cwd: {os.getcwd()}, stderr: {error_msg[:500]}")
+                if signal_num == 11:  # SIGSEGV
+                    logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
+                return None, 0, 0
+            
+            # Check for subprocess.run() exceptions (timeout, etc.)
+            if not result.get('success', False):
+                error_msg = result.get('error', 'Unknown error')
+                stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
+                logger.error(f"ffmpeg conversion failed: {error_msg}, stderr: {stderr_msg[:500]}")
+                return None, 0, 0
             
             if process_returncode != 0:
                 error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"

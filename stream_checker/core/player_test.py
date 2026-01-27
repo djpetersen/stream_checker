@@ -15,6 +15,7 @@ from stream_checker.utils.multiprocessing_utils import (
     ensure_spawn_method,
     run_process_with_queue
 )
+from stream_checker.utils.subprocess_utils import run_subprocess_safe
 
 logger = logging.getLogger("stream_checker")
 
@@ -477,12 +478,12 @@ class PlayerTesterFallback:
                         if vlc_path:
                             paths.insert(0, vlc_path)
                 else:
-                    which_result = subprocess.run(["which", "vlc"], capture_output=True, timeout=2)
-                    if which_result.returncode == 0:
-                        vlc_path = which_result.stdout.decode().strip()
+                    which_result = run_subprocess_safe(["which", "vlc"], timeout=2.0, text=False)
+                    if which_result.get('success') and which_result.get('returncode') == 0:
+                        vlc_path = which_result.get('stdout').decode().strip() if which_result.get('stdout') else None
                         if vlc_path:
                             paths.insert(0, vlc_path)
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError, Exception):
+            except (FileNotFoundError, OSError, Exception):
                 pass
         elif system == "Linux":
             paths = ["/usr/bin/vlc", "/usr/local/bin/vlc", "vlc"]
@@ -510,14 +511,14 @@ class PlayerTesterFallback:
                     if ok and result and result.get('success') and result.get('returncode') == 0:
                         return path
                 else:
-                    result = subprocess.run(
+                    result = run_subprocess_safe(
                         [path, "--version"],
-                        capture_output=True,
-                        timeout=5
+                        timeout=5.0,
+                        text=False
                     )
-                    if result.returncode == 0:
+                    if result.get('success') and result.get('returncode') == 0:
                         return path
-            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            except (FileNotFoundError, Exception):
                 continue
         
         return None

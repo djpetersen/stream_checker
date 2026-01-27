@@ -101,6 +101,27 @@ else
     echo "✅ PASS: No Process/Queue patterns in core modules"
 fi
 
+# Check 6: No direct subprocess.run( in core modules (must use run_subprocess_safe)
+echo ""
+echo "Check 6: Verifying no direct subprocess.run( in core modules..."
+if [ "$GREP_CMD" = "rg" ]; then
+    # Find all subprocess.run( calls, excluding comments and docstrings
+    # Filter out lines that are comments (start with #) or are in comments/docstrings
+    SUBPROCESS_RUN=$($GREP_CMD "subprocess\.run\(" stream_checker/core/ $GREP_ARGS | grep -vE "^\s*#|#.*subprocess\.run|Check for subprocess" || true)
+else
+    # Use grep with pattern matching, exclude comment lines and docstring mentions
+    SUBPROCESS_RUN=$(grep -rn "subprocess\.run(" stream_checker/core/ --include="*.py" | grep -vE "^\s*#|#.*subprocess\.run|Check for subprocess" || true)
+fi
+if [ -n "$SUBPROCESS_RUN" ]; then
+    echo "❌ FAIL: Found direct subprocess.run( calls in core modules (must use run_subprocess_safe):"
+    echo "$SUBPROCESS_RUN"
+    echo ""
+    echo "Allowed location: stream_checker/utils/subprocess_utils.py only"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "✅ PASS: No direct subprocess.run( calls in core modules"
+fi
+
 # Summary
 echo ""
 if [ $ERRORS -eq 0 ]; then

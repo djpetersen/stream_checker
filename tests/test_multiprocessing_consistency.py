@@ -98,9 +98,12 @@ class TestMultiprocessingConsistency(unittest.TestCase):
             name="test_crash"
         )
         
-        # Worker crashes, so queue is empty
+        # Worker crashes, should return structured failure info
         self.assertFalse(ok, "Process should fail on crash")
-        self.assertIsNone(result, "Result should be None on crash")
+        # Result may be None (timeout/empty queue) or structured failure info (non-zero exitcode)
+        if result is not None:
+            # If structured failure, should have exitcode
+            self.assertIn('exitcode', result, "Failure info should include exitcode")
     
     def test_spawn_method_set_on_macos(self):
         """Test that spawn method is set on macOS (required for fork safety)"""
