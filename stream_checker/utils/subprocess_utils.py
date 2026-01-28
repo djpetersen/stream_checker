@@ -51,6 +51,17 @@ def _ensure_spawn_method():
 
 def _subprocess_worker_pipe(conn, cmd: List[str], timeout: float, cwd: Optional[str], env: Optional[Dict[str, str]], text: bool):
     """Worker function that runs subprocess in spawned process - must be at module level for pickling"""
+    # Set env var in os.environ so nested run_subprocess_safe calls can detect we're in a helper process
+    # This prevents nested spawn timeouts when run_subprocess_safe is called from within the helper
+    os.environ['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
+    
+    # Merge env var into env dict if provided (for subprocess.run calls)
+    if env is not None:
+        env['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
+    else:
+        # If no env dict provided, create one with the helper flag
+        env = {'STREAM_CHECKER_SUBPROCESS_HELPER': '1'}
+    
     result = None
     try:
         process = subprocess.run(
@@ -156,6 +167,9 @@ def run_subprocess_safe(
     On macOS: Runs subprocess.run() inside a spawned helper process using
     multiprocessing spawn context, returns result via Pipe (avoids Queue semaphores).
     
+    If already running in a helper process (detected via STREAM_CHECKER_SUBPROCESS_HELPER
+    env var), calls subprocess.run() directly to avoid nested spawn timeouts.
+    
     On non-macOS: Calls subprocess.run() directly.
     
     Args:
@@ -177,6 +191,52 @@ def run_subprocess_safe(
         - 'error': str or None (error message if subprocess.run() raised exception)
         - 'timeout': float or None (timeout value if TimeoutExpired)
     """
+    # Check if we're already in a helper process (prevents nested spawn)
+    if os.environ.get('STREAM_CHECKER_SUBPROCESS_HELPER') == '1':
+        # Already in helper process - call subprocess.run() directly
+        try:
+            process = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                cwd=cwd,
+                env=env,
+                text=text
+            )
+            # Classify returncode for signal kills
+            signal_info = _classify_returncode(process.returncode)
+            return {
+                'returncode': process.returncode,
+                'stdout': process.stdout,
+                'stderr': process.stderr,
+                'success': True,
+                **signal_info
+            }
+        except subprocess.TimeoutExpired as e:
+            return {
+                'returncode': None,
+                'stdout': None,
+                'stderr': e.stderr if hasattr(e, 'stderr') else None,
+                'success': False,
+                'error': 'timeout',
+                'timeout': timeout,
+                'signal_num': None,
+                'signal_name': None,
+                'is_signal_kill': False
+            }
+        except Exception as e:
+            return {
+                'returncode': None,
+                'stdout': None,
+                'stderr': None,
+                'success': False,
+                'error': str(e),
+                'signal_num': None,
+                'signal_name': None,
+                'is_signal_kill': False
+            }
+    
     if platform.system() == "Darwin":
         # macOS: Use multiprocessing spawn to avoid fork crash
         _ensure_spawn_method()
@@ -189,10 +249,17 @@ def run_subprocess_safe(
             # Create Pipe (one-way: parent receives, child sends)
             parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
             
+            # Prepare env for child process - merge with current environment and add helper flag
+            # This allows nested calls to detect they're in a helper process
+            child_env = dict(os.environ)
+            if env:
+                child_env.update(env)
+            child_env['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
+            
             # Create process
             process_obj = multiprocessing.Process(
                 target=_subprocess_worker_pipe,
-                args=(child_conn, cmd, timeout, cwd, env, text)
+                args=(child_conn, cmd, timeout, cwd, child_env, text)
             )
             
             # Start process

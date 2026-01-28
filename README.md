@@ -280,6 +280,44 @@ python stream_checker.py --url https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
 python stream_checker.py --url https://streams.radiomast.io/ref-128k-aaclc-stereo
 ```
 
+### Crash Regression Check (macOS)
+
+On macOS, subprocess calls in multi-threaded processes can cause fork crashes. This project uses a safe helper process mechanism (`run_subprocess_safe`) to prevent these crashes. The regression test verifies that no subprocess calls occur in the main process.
+
+**Run the regression test:**
+
+```bash
+# Using the test script (recommended)
+./scripts/test_fork_regression_macos.sh
+
+# Or directly with pytest
+pytest tests/test_no_main_process_subprocess.py -v
+
+# Or run the Python test directly
+python3 tests/test_no_main_process_subprocess.py
+```
+
+**What it does:**
+
+1. Runs 5 test streams with `STREAM_CHECKER_TRACE_SUBPROCESS=1` enabled
+2. Parses trace logs to identify subprocess call contexts
+3. **Fails if any subprocess calls occur in MAIN PROCESS context**
+4. **Passes only if all calls are in HELPER PROCESS context**
+
+**Expected output:**
+
+```
+✅ PASSED: All X subprocess calls executed in HELPER PROCESS context
+```
+
+**If the test fails:**
+
+- Check for direct `subprocess.run()` or `subprocess.Popen()` calls in `stream_checker/core/`
+- Ensure all subprocess calls go through `run_subprocess_safe()` from `stream_checker/utils/subprocess_utils.py`
+- Run `scripts/mp_consistency_check.sh` to find forbidden patterns
+
+This test should be run before committing changes that touch subprocess execution paths, especially on macOS.
+
 ### Code Structure
 
 - `stream_checker.py`: Main CLI entry point

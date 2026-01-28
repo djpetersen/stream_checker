@@ -1,8 +1,6 @@
 """Phase 2: Player connectivity testing"""
 
 import time
-import threading
-import subprocess
 import multiprocessing
 import platform
 import os
@@ -29,64 +27,50 @@ except (ImportError, OSError) as e:
 
 
 def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
-    """Worker function for VLC subprocess - runs in separate process to avoid fork crash"""
+    """Worker function for VLC subprocess - uses run_subprocess_safe for platform-agnostic safety"""
     import time
-    process = None
-    start_time = None
+    start_time = time.time()
     result = None
     
     try:
-        process = subprocess.Popen(
-            cmd + [url],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL
+        # Build full command with URL
+        full_cmd = cmd + [url]
+        
+        # Use run_subprocess_safe for platform-agnostic subprocess execution
+        # VLC will exit after --run-time duration, so timeout should be slightly longer
+        subprocess_result = run_subprocess_safe(
+            full_cmd,
+            timeout=total_timeout,
+            text=False
         )
         
-        start_time = time.time()
+        elapsed_time = time.time() - start_time
         
-        # Wait for process with timeout
-        try:
-            stdout, stderr = process.communicate(timeout=total_timeout)
-            return_code = process.returncode
-            elapsed_time = time.time() - start_time
+        # Convert run_subprocess_safe result format to worker result format
+        if subprocess_result.get('success', False):
             result = {
                 'success': True,
-                'returncode': return_code,
-                'stdout': stdout,
-                'stderr': stderr,
+                'returncode': subprocess_result.get('returncode'),
+                'stdout': subprocess_result.get('stdout'),
+                'stderr': subprocess_result.get('stderr'),
                 'elapsed_time': elapsed_time
             }
-        except subprocess.TimeoutExpired:
-            # Try graceful termination first
-            try:
-                process.terminate()
-                stdout, stderr = process.communicate(timeout=5)
-                return_code = process.returncode
-                elapsed_time = time.time() - start_time
-                result = {
-                    'success': True,
-                    'returncode': return_code,
-                    'stdout': stdout,
-                    'stderr': stderr,
-                    'timeout': True,
-                    'elapsed_time': elapsed_time
-                }
-            except subprocess.TimeoutExpired:
-                # Force kill if terminate didn't work
-                process.kill()
-                process.wait()
-                elapsed_time = time.time() - start_time
-                result = {
-                    'success': False,
-                    'returncode': None,
-                    'stdout': None,
-                    'stderr': None,
-                    'error': 'timeout',
-                    'elapsed_time': elapsed_time
-                }
+            # Check if it was a timeout
+            if subprocess_result.get('error') == 'timeout':
+                result['timeout'] = True
+        else:
+            # Handle errors from run_subprocess_safe
+            error_msg = subprocess_result.get('error', 'Unknown error')
+            result = {
+                'success': False,
+                'returncode': subprocess_result.get('returncode'),
+                'stdout': subprocess_result.get('stdout'),
+                'stderr': subprocess_result.get('stderr'),
+                'error': error_msg,
+                'elapsed_time': elapsed_time
+            }
     except Exception as e:
-        elapsed_time = time.time() - start_time if start_time else 0
+        elapsed_time = time.time() - start_time
         result = {
             'success': False,
             'returncode': None,
@@ -102,7 +86,7 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
                 queue.put(result)
             else:
                 # Fallback if result was never set
-                elapsed_time = time.time() - start_time if start_time else 0
+                elapsed_time = time.time() - start_time
                 queue.put({
                     'success': False,
                     'returncode': None,
@@ -115,19 +99,6 @@ def _run_vlc_worker(queue, cmd, url, playback_duration, total_timeout):
             # If queue.put fails (e.g., queue is closed), we can't do anything
             # The parent will timeout and clean up
             logger.debug(f"Error putting result in queue in _run_vlc_worker: {e}")
-        
-        # Clean up process if still running
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=1)
-            except Exception as e:
-                logger.debug(f"Error terminating VLC process in worker: {e}")
-                try:
-                    process.kill()
-                    process.wait()
-                except Exception as e2:
-                    logger.debug(f"Error killing VLC process in worker: {e2}")
 
 
 class PlayerTester:
@@ -544,137 +515,60 @@ class PlayerTesterFallback:
             return result
         
         try:
-            # Run VLC with timeout
+            # Run VLC with timeout - use platform-agnostic safe subprocess helper
             start_time = time.time()
             total_timeout = self.connection_timeout + self.playback_duration + 10  # Add buffer
             
-            # On macOS, use multiprocessing to avoid fork crash
-            # On other platforms, subprocess is safe
-            if platform.system() == "Darwin":
-                # Use multiprocessing for VLC on macOS
-                vlc_cmd_list = [
-                    vlc_cmd,
-                    "--intf", "dummy",
-                    "--quiet",
-                    "--no-video",
-                    "--run-time", str(self.playback_duration),
-                    "--network-caching=3000"
-                ]
-                
-                ok, vlc_result = run_process_with_queue(
-                    target=_run_vlc_worker,
-                    args=(vlc_cmd_list, url, self.playback_duration, total_timeout),
-                    join_timeout=total_timeout + 10,
-                    get_timeout=0.5,
-                    name="PlayerTesterFallback.check"
-                )
-                
-                if not ok or not vlc_result:
-                    result["status"] = "error"
-                    if not ok:
-                        result["errors"].append("VLC process timeout")
-                    else:
-                        result["errors"].append("VLC process result queue is empty")
-                    return result
-                
-                return_code = vlc_result.get('returncode')
-                stdout = vlc_result.get('stdout')
-                stderr = vlc_result.get('stderr')
-                elapsed_time = vlc_result.get('elapsed_time', 0)
-                
-                result["playback_duration_seconds"] = round(elapsed_time, 2)
-                
-                # Check return code
-                if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
-                    result["status"] = "success"
-                    result["format_supported"] = True
-                    # Estimate connection time (first 20% of total time, max 5 seconds)
-                    connection_time = min(elapsed_time * 0.2, 5.0)
-                    result["connection_time_ms"] = int(connection_time * 1000)
+            # Build VLC command - VLC will exit after --run-time duration
+            vlc_cmd_list = [
+                vlc_cmd,
+                "--intf", "dummy",
+                "--quiet",
+                "--no-video",
+                "--run-time", str(self.playback_duration),
+                "--network-caching=3000",
+                url
+            ]
+            
+            # Use multiprocessing queue for VLC execution (platform-agnostic)
+            ok, vlc_result = run_process_with_queue(
+                target=_run_vlc_worker,
+                args=(vlc_cmd_list, url, self.playback_duration, total_timeout),
+                join_timeout=total_timeout + 10,
+                get_timeout=0.5,
+                name="PlayerTesterFallback.check"
+            )
+            
+            if not ok or not vlc_result:
+                result["status"] = "error"
+                if not ok:
+                    result["errors"].append("VLC process timeout")
                 else:
-                    result["status"] = "error"
-                    if return_code != -15:  # Don't add error for SIGTERM
-                        result["errors"].append(f"VLC returned error code {return_code}")
-                    if stderr:
-                        error_text = stderr.decode('utf-8', errors='ignore')
-                        if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
-                            result["error_details"] = error_text[:500]  # Limit error text
+                    result["errors"].append("VLC process result queue is empty")
+                return result
+            
+            return_code = vlc_result.get('returncode')
+            stdout = vlc_result.get('stdout')
+            stderr = vlc_result.get('stderr')
+            elapsed_time = vlc_result.get('elapsed_time', 0)
+            
+            result["playback_duration_seconds"] = round(elapsed_time, 2)
+            
+            # Check return code
+            if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
+                result["status"] = "success"
+                result["format_supported"] = True
+                # Estimate connection time (first 20% of total time, max 5 seconds)
+                connection_time = min(elapsed_time * 0.2, 5.0)
+                result["connection_time_ms"] = int(connection_time * 1000)
             else:
-                # On other platforms, subprocess is safe
-                process = subprocess.Popen(
-                    [
-                        vlc_cmd,
-                        "--intf", "dummy",
-                        "--quiet",
-                        "--no-video",
-                        "--run-time", str(self.playback_duration),
-                        "--network-caching=3000",
-                        url
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.DEVNULL
-                )
-                
-                # Start a timer to stop VLC after playback duration
-                def stop_vlc():
-                    time.sleep(self.playback_duration + 2)  # Add 2 seconds buffer
-                    if process.poll() is None:  # Process still running
-                        try:
-                            process.terminate()
-                        except (OSError, ProcessLookupError) as e:
-                            logger.debug(f"Error terminating VLC process: {e}")
-                
-                timer_thread = threading.Thread(target=stop_vlc, daemon=True)
-                timer_thread.start()
-                
-                # Wait for process with timeout
-                try:
-                    stdout, stderr = process.communicate(timeout=total_timeout)
-                    return_code = process.returncode
-                    
-                    elapsed_time = time.time() - start_time
-                    result["playback_duration_seconds"] = round(elapsed_time, 2)
-                    
-                    # Check return code
-                    if return_code == 0 or return_code == -15:  # -15 is SIGTERM (normal termination)
-                        result["status"] = "success"
-                        result["format_supported"] = True
-                        # Estimate connection time (first 20% of total time, max 5 seconds)
-                        connection_time = min(elapsed_time * 0.2, 5.0)
-                        result["connection_time_ms"] = int(connection_time * 1000)
-                    else:
-                        result["status"] = "error"
-                        if return_code != -15:  # Don't add error for SIGTERM
-                            result["errors"].append(f"VLC returned error code {return_code}")
-                        if stderr:
-                            error_text = stderr.decode('utf-8', errors='ignore')
-                            if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
-                                result["error_details"] = error_text[:500]  # Limit error text
-                except subprocess.TimeoutExpired:
-                    # Try graceful termination first
-                    try:
-                        process.terminate()
-                        stdout, stderr = process.communicate(timeout=5)
-                        return_code = process.returncode
-                        elapsed_time = time.time() - start_time
-                        result["playback_duration_seconds"] = round(elapsed_time, 2)
-                        
-                        if return_code == 0:
-                            result["status"] = "success"
-                            result["format_supported"] = True
-                        else:
-                            result["status"] = "error"
-                            result["errors"].append("Process timeout (terminated)")
-                    except subprocess.TimeoutExpired:
-                        # Force kill if terminate didn't work
-                        process.kill()
-                        stdout, stderr = process.communicate()
-                        return_code = -1
-                        elapsed_time = time.time() - start_time
-                        result["playback_duration_seconds"] = round(elapsed_time, 2)
-                        result["status"] = "error"
-                        result["errors"].append("Process timeout (killed)")
+                result["status"] = "error"
+                if return_code != -15:  # Don't add error for SIGTERM
+                    result["errors"].append(f"VLC returned error code {return_code}")
+                if stderr:
+                    error_text = stderr.decode('utf-8', errors='ignore') if isinstance(stderr, bytes) else str(stderr)
+                    if error_text and "error" not in error_text.lower()[:100]:  # Only if it's a real error
+                        result["error_details"] = error_text[:500]  # Limit error text
         
         except FileNotFoundError:
             result["status"] = "error"

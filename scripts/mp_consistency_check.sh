@@ -122,6 +122,26 @@ else
     echo "✅ PASS: No direct subprocess.run( calls in core modules"
 fi
 
+# Check 7: No direct subprocess.Popen( in core modules (must use run_subprocess_safe)
+echo ""
+echo "Check 7: Verifying no direct subprocess.Popen( in core modules..."
+if [ "$GREP_CMD" = "rg" ]; then
+    # Find all subprocess.Popen( calls, excluding comments and docstrings
+    SUBPROCESS_POPEN=$($GREP_CMD "subprocess\.Popen\(" stream_checker/core/ $GREP_ARGS | grep -vE "^\s*#|#.*subprocess\.Popen|Check for subprocess" || true)
+else
+    # Use grep with pattern matching, exclude comment lines and docstring mentions
+    SUBPROCESS_POPEN=$(grep -rn "subprocess\.Popen(" stream_checker/core/ --include="*.py" | grep -vE "^\s*#|#.*subprocess\.Popen|Check for subprocess" || true)
+fi
+if [ -n "$SUBPROCESS_POPEN" ]; then
+    echo "❌ FAIL: Found direct subprocess.Popen( calls in core modules (must use run_subprocess_safe):"
+    echo "$SUBPROCESS_POPEN"
+    echo ""
+    echo "Allowed location: stream_checker/utils/subprocess_utils.py only"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "✅ PASS: No direct subprocess.Popen( calls in core modules"
+fi
+
 # Summary
 echo ""
 if [ $ERRORS -eq 0 ]; then

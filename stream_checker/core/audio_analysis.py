@@ -2,9 +2,7 @@
 
 import os
 import shutil
-import subprocess
 import tempfile
-import multiprocessing
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import logging
@@ -13,63 +11,6 @@ from stream_checker.utils.file_utils import safe_remove_file
 from stream_checker.utils.subprocess_utils import run_subprocess_safe
 
 logger = logging.getLogger("stream_checker")
-
-
-def _run_subprocess_safe(cmd, timeout, stdout, stderr):
-    """
-    Run subprocess in a spawned process to avoid fork issues on macOS.
-    This function runs in a separate process and returns the result via a queue.
-    Routes through run_subprocess_safe for improved stability on macOS.
-    """
-    # Route through run_subprocess_safe (stdout/stderr params ignored, always uses PIPE)
-    result = run_subprocess_safe(
-        cmd,
-        timeout=timeout,
-        text=False
-    )
-    # Return in the same format as before for compatibility
-    return {
-        'returncode': result.get('returncode'),
-        'stdout': result.get('stdout'),
-        'stderr': result.get('stderr'),
-        'success': result.get('success', False),
-        'error': result.get('error')
-    }
-
-
-def _run_subprocess_worker(queue, cmd, timeout):
-    """Worker function for multiprocessing - must be at module level for pickling"""
-    result = None
-    try:
-        result = _run_subprocess_safe(cmd, timeout, subprocess.PIPE, subprocess.PIPE)
-    except Exception as e:
-        # Create error result
-        result = {
-            'success': False,
-            'returncode': None,
-            'stdout': None,
-            'stderr': None,
-            'error': str(e)
-        }
-    finally:
-        # Always try to put result, even if it's None
-        try:
-            if result is not None:
-                queue.put(result)
-            else:
-                # Fallback if result is somehow None
-                queue.put({
-                    'success': False,
-                    'returncode': None,
-                    'stdout': None,
-                    'stderr': None,
-                    'error': 'Unknown error in worker'
-                })
-        except Exception as e:
-            # If queue.put fails (e.g., queue is closed), we can't do anything
-            # The parent will timeout and clean up
-            pass
-    # Note: Don't close queue here - it's managed by the caller
 
 
 class AudioAnalyzer:
@@ -204,8 +145,33 @@ class AudioAnalyzer:
         logger.warning("_find_ffmpeg: ffmpeg not found in PATH or known locations")
         return None
     
+    def _parse_ffmpeg_error(self, stderr: str, returncode: int) -> str:
+        """Parse ffmpeg stderr for common error patterns"""
+        if not stderr:
+            return f"Unknown error (returncode: {returncode})"
+        
+        stderr_lower = stderr.lower()
+        
+        # Common error patterns
+        if "connection refused" in stderr_lower or "connection timed out" in stderr_lower:
+            return "Connection error"
+        elif "codec not found" in stderr_lower or "unknown codec" in stderr_lower:
+            return "Codec not supported"
+        elif "invalid data found" in stderr_lower or "invalid argument" in stderr_lower:
+            return "Invalid stream format"
+        elif "network" in stderr_lower and "error" in stderr_lower:
+            return "Network error"
+        elif "timeout" in stderr_lower:
+            return "Timeout"
+        else:
+            # Return first meaningful error line
+            lines = [l.strip() for l in stderr.split('\n') if l.strip() and not l.startswith('ffmpeg')]
+            if lines:
+                return lines[0][:200]
+            return f"Unknown error (returncode: {returncode})"
+    
     def _download_audio_sample(self, url: str) -> Optional[str]:
-        """Download audio sample using ffmpeg"""
+        """Download audio sample using ffmpeg with progressive fallback"""
         # Check if ffmpeg is available
         ffmpeg_path = self._find_ffmpeg()
         if not ffmpeg_path:
@@ -217,63 +183,86 @@ class AudioAnalyzer:
         os.close(temp_fd)
         
         try:
-            # Use ffmpeg to download and convert audio
-            cmd = [
-                ffmpeg_path,
-                "-i", url,
-                "-t", str(self.sample_duration),  # Duration
-                "-acodec", "libmp3lame",  # MP3 codec
-                "-ar", "44100",  # Sample rate
-                "-ac", "2",  # Stereo
-                "-y",  # Overwrite output
-                temp_path
+            # Progressive fallback strategies
+            strategies = [
+                ("copy", [
+                    ffmpeg_path,
+                    "-i", url,
+                    "-t", str(self.sample_duration),
+                    "-c", "copy",  # Copy codec (no re-encoding) - fastest, most compatible
+                    "-y",
+                    temp_path
+                ]),
+                ("minimal_conversion", [
+                    ffmpeg_path,
+                    "-i", url,
+                    "-t", str(self.sample_duration),
+                    "-c:a", "copy",  # Try to copy audio codec
+                    "-ar", "44100",  # Resample if needed
+                    "-ac", "2",  # Convert to stereo if needed
+                    "-y",
+                    temp_path
+                ]),
+                ("full_conversion", [
+                    ffmpeg_path,
+                    "-i", url,
+                    "-t", str(self.sample_duration),
+                    "-acodec", "libmp3lame",  # Full conversion to MP3 (original approach)
+                    "-ar", "44100",
+                    "-ac", "2",
+                    "-y",
+                    temp_path
+                ])
             ]
             
-            # Run ffmpeg with timeout - use run_subprocess_safe to avoid fork crashes on macOS
-            timeout = self.sample_duration + 30  # Add buffer
-            result = run_subprocess_safe(
-                cmd,
-                timeout=timeout,
-                text=False
-            )
+            # Increased timeout for slow streams
+            timeout = self.sample_duration * 2 + 30  # Was: sample_duration + 30
             
-            process_returncode = result.get('returncode')
-            process_stderr = result.get('stderr')
-            
-            # Check for signal crashes (handled by run_subprocess_safe)
-            if result.get('is_signal_kill'):
-                signal_num = result.get('signal_num')
-                signal_name = result.get('signal_name', f'SIG{signal_num}')
-                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
-                logger.error(f"ffmpeg binary crashed with {signal_name} (signal {signal_num}, exitcode={process_returncode}) in _download_audio_sample")
-                logger.error(f"ffmpeg argv: {cmd}, cwd: {os.getcwd()}, stderr: {error_msg[:500]}")
-                safe_remove_file(temp_path, context="_download_audio_sample")
-                return None
-            
-            # Check for subprocess.run() exceptions (timeout, etc.)
-            if not result.get('success', False):
-                error_msg = result.get('error', 'Unknown error')
-                if 'timeout' in error_msg.lower():
-                    logger.error("ffmpeg timeout")
+            for strategy_name, cmd in strategies:
+                logger.debug(f"Trying download strategy: {strategy_name} for {url}")
+                
+                # Run ffmpeg with timeout - use run_subprocess_safe (detects helper process to avoid nested spawn)
+                result = run_subprocess_safe(
+                    cmd,
+                    timeout=timeout,
+                    text=False
+                )
+                
+                process_returncode = result.get('returncode')
+                process_stderr = result.get('stderr')
+                
+                # Check for subprocess failures (timeout, etc.)
+                if not result.get('success', False):
+                    error_msg = result.get('error', 'Unknown error')
+                    if 'timeout' in error_msg.lower():
+                        logger.debug(f"ffmpeg timeout after {timeout}s (strategy: {strategy_name})")
+                    else:
+                        stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
+                        parsed_error = self._parse_ffmpeg_error(stderr_msg, process_returncode or -1)
+                        logger.debug(f"ffmpeg failed (strategy: {strategy_name}): {error_msg}, parsed: {parsed_error}")
+                    # Continue to next strategy
+                    continue
+                
+                if process_returncode == 0 and os.path.exists(temp_path):
+                    file_size = os.path.getsize(temp_path)
+                    if file_size > 0:
+                        logger.info(f"Download succeeded with strategy: {strategy_name} for {url}")
+                        return temp_path
+                    else:
+                        logger.debug(f"ffmpeg produced empty file: {temp_path} (strategy: {strategy_name})")
+                        # Continue to next strategy
+                        continue
                 else:
-                    stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
-                    logger.error(f"ffmpeg failed: {error_msg}, stderr: {stderr_msg[:500]}")
-                safe_remove_file(temp_path, context="_download_audio_sample")
-                return None
+                    stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
+                    parsed_error = self._parse_ffmpeg_error(stderr_msg, process_returncode or -1)
+                    logger.debug(f"ffmpeg failed (code {process_returncode}, strategy: {strategy_name}): {parsed_error}")
+                    # Continue to next strategy
+                    continue
             
-            if process_returncode == 0 and os.path.exists(temp_path):
-                file_size = os.path.getsize(temp_path)
-                if file_size > 0:
-                    return temp_path
-                else:
-                    logger.warning(f"ffmpeg produced empty file: {temp_path}")
-                    safe_remove_file(temp_path, context="_download_audio_sample")
-                    return None
-            else:
-                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
-                logger.error(f"ffmpeg failed (code {process_returncode}): {error_msg}")
-                safe_remove_file(temp_path, context="_download_audio_sample")
-                return None
+            # All strategies failed
+            logger.error(f"All download strategies failed for {url}")
+            safe_remove_file(temp_path, context="_download_audio_sample")
+            return None
         
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
@@ -298,7 +287,7 @@ class AudioAnalyzer:
                 "-"  # Output to stdout
             ]
             
-            # Use run_subprocess_safe to avoid fork crashes on macOS
+            # Use run_subprocess_safe (detects helper process to avoid nested spawn)
             result = run_subprocess_safe(
                 cmd,
                 timeout=30,
@@ -309,22 +298,12 @@ class AudioAnalyzer:
             process_stdout = result.get('stdout')
             process_stderr = result.get('stderr')
             
-            # Check for signal crashes (handled by run_subprocess_safe)
-            if result.get('is_signal_kill'):
-                signal_num = result.get('signal_num')
-                signal_name = result.get('signal_name', f'SIG{signal_num}')
-                error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
-                logger.error(f"ffmpeg conversion crashed with {signal_name} (signal {signal_num}, exitcode={process_returncode}) in _load_audio_raw")
-                logger.error(f"ffmpeg argv: {cmd}, cwd: {os.getcwd()}, stderr: {error_msg[:500]}")
-                if signal_num == 11:  # SIGSEGV
-                    logger.error("SIGSEGV detected in _load_audio_raw - failing Phase 3 immediately")
-                return None, 0, 0
-            
-            # Check for subprocess.run() exceptions (timeout, etc.)
+            # Check for subprocess failures (timeout, etc.)
             if not result.get('success', False):
                 error_msg = result.get('error', 'Unknown error')
                 stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
                 logger.error(f"ffmpeg conversion failed: {error_msg}, stderr: {stderr_msg[:500]}")
+                logger.error(f"ffmpeg argv: {cmd}, cwd: {os.getcwd()}, returncode: {process_returncode}")
                 return None, 0, 0
             
             if process_returncode != 0:

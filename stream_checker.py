@@ -26,6 +26,10 @@ from typing import Any
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Install subprocess tracing if enabled (must be before any subprocess imports)
+from stream_checker.utils.subprocess_trace import install_tracing
+install_tracing()
+
 from stream_checker.security.key_management import generate_test_run_id, generate_stream_id
 from stream_checker.security.validation import URLValidator, ValidationError, validate_phase, validate_silence_threshold, validate_sample_duration
 from stream_checker.core.connectivity import ConnectivityChecker
