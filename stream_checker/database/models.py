@@ -101,6 +101,37 @@ class Database:
                 ON request_logs(stream_id)
             """)
             
+            # Listening sessions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS listening_sessions (
+                    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_address TEXT NOT NULL,
+                    stream_url TEXT NOT NULL,
+                    user_agent TEXT,
+                    start_timestamp TIMESTAMP NOT NULL,
+                    end_timestamp TIMESTAMP,
+                    listening_time_seconds REAL NOT NULL,
+                    action_type TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create indexes for listening_sessions
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_listening_sessions_ip_timestamp 
+                ON listening_sessions(ip_address, start_timestamp)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_listening_sessions_timestamp 
+                ON listening_sessions(start_timestamp)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_listening_sessions_stream_url 
+                ON listening_sessions(stream_url)
+            """)
+            
             conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error initializing database: {e}")
@@ -545,3 +576,144 @@ class Database:
         except sqlite3.Error as e:
             logger.error(f"Error getting IP request count: {e}")
             return 0
+    
+    def log_listening_session(
+        self,
+        ip_address: str,
+        stream_url: str,
+        start_timestamp: datetime,
+        end_timestamp: datetime,
+        listening_time_seconds: float,
+        action_type: str,
+        user_agent: Optional[str] = None
+    ) -> int:
+        """
+        Log a listening session (play to pause/stop, or unpause to pause/stop)
+        
+        Args:
+            ip_address: Client IP address
+            stream_url: Stream URL being listened to
+            start_timestamp: When listening started (play or unpause)
+            end_timestamp: When listening ended (pause or stop)
+            listening_time_seconds: Duration of listening in seconds
+            action_type: Type of action that ended listening ('pause' or 'stop')
+            user_agent: User-Agent header (optional)
+            
+        Returns:
+            session_id of the logged session
+            
+        Raises:
+            ValueError: If required parameters are invalid
+            sqlite3.Error: If database operation fails
+        """
+        # Validate required parameters
+        if not ip_address or not isinstance(ip_address, str):
+            raise ValueError("ip_address must be a non-empty string")
+        if not stream_url or not isinstance(stream_url, str):
+            raise ValueError("stream_url must be a non-empty string")
+        if not isinstance(start_timestamp, datetime):
+            raise ValueError("start_timestamp must be a datetime object")
+        if not isinstance(end_timestamp, datetime):
+            raise ValueError("end_timestamp must be a datetime object")
+        if not isinstance(listening_time_seconds, (int, float)) or listening_time_seconds < 0:
+            raise ValueError("listening_time_seconds must be a non-negative number")
+        if action_type not in ('pause', 'stop'):
+            raise ValueError("action_type must be 'pause' or 'stop'")
+        
+        with self._get_connection_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO listening_sessions (
+                    ip_address, stream_url, user_agent,
+                    start_timestamp, end_timestamp,
+                    listening_time_seconds, action_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ip_address,
+                stream_url,
+                user_agent,
+                start_timestamp.isoformat(),
+                end_timestamp.isoformat(),
+                listening_time_seconds,
+                action_type
+            ))
+            
+            session_id = cursor.lastrowid
+            conn.commit()
+            return session_id
+    
+    def get_listening_history(
+        self,
+        ip_address: Optional[str] = None,
+        stream_url: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get listening session history with optional filters
+        
+        Args:
+            ip_address: Filter by IP address (optional)
+            stream_url: Filter by stream URL (optional)
+            limit: Maximum number of records to return (1-10000, default: 100)
+            
+        Returns:
+            List of listening session dictionaries
+            
+        Raises:
+            ValueError: If limit is invalid
+        """
+        # Validate limit
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if limit > 10000:
+            raise ValueError("limit cannot exceed 10000")
+        
+        try:
+            with self._get_connection_context() as conn:
+                cursor = conn.cursor()
+                
+                query_parts = [
+                    "SELECT session_id, ip_address, stream_url, user_agent,",
+                    "start_timestamp, end_timestamp, listening_time_seconds, action_type, created_at",
+                    "FROM listening_sessions",
+                    "WHERE 1=1"
+                ]
+                params = []
+                
+                if ip_address:
+                    if not isinstance(ip_address, str) or not ip_address.strip():
+                        raise ValueError("ip_address must be a non-empty string")
+                    query_parts.append("AND ip_address = ?")
+                    params.append(ip_address.strip())
+                
+                if stream_url:
+                    if not isinstance(stream_url, str) or not stream_url.strip():
+                        raise ValueError("stream_url must be a non-empty string")
+                    query_parts.append("AND stream_url = ?")
+                    params.append(stream_url.strip())
+                
+                query_parts.append("ORDER BY start_timestamp DESC LIMIT ?")
+                params.append(limit)
+                
+                query = " ".join(query_parts)
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                return [
+                    {
+                        "session_id": row["session_id"],
+                        "ip_address": row["ip_address"],
+                        "stream_url": row["stream_url"],
+                        "user_agent": row["user_agent"],
+                        "start_timestamp": row["start_timestamp"],
+                        "end_timestamp": row["end_timestamp"],
+                        "listening_time_seconds": row["listening_time_seconds"],
+                        "action_type": row["action_type"],
+                        "created_at": row["created_at"]
+                    }
+                    for row in rows
+                ]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting listening history: {e}")
+            return []
