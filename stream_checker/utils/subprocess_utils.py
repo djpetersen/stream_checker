@@ -4,6 +4,7 @@ import os
 import platform
 import subprocess
 import multiprocessing
+import tempfile
 from typing import Dict, Any, Optional, List, Union
 import logging
 
@@ -105,6 +106,74 @@ def _subprocess_worker_pipe(conn, cmd: List[str], timeout: float, cwd: Optional[
             conn.close()
 
 
+def _subprocess_worker_stdout_to_file(
+    conn,
+    cmd: List[str],
+    timeout: float,
+    cwd: Optional[str],
+    env: Optional[Dict[str, str]],
+    text: bool,
+    stdout_file_path: str,
+):
+    """Worker that runs subprocess with stdout written to a file; sends (returncode, stderr, path, size) back."""
+    os.environ['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
+    if env is not None:
+        env = dict(env)
+        env['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
+    else:
+        env = {'STREAM_CHECKER_SUBPROCESS_HELPER': '1'}
+    result = None
+    try:
+        with open(stdout_file_path, 'wb') as fout:
+            process = subprocess.run(
+                cmd,
+                stdout=fout,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                cwd=cwd,
+                env=env,
+                text=text
+            )
+        size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+        result = {
+            'returncode': process.returncode,
+            'stdout': None,
+            'stdout_path': stdout_file_path,
+            'stdout_size': size,
+            'stderr': process.stderr,
+            'success': True
+        }
+    except subprocess.TimeoutExpired as e:
+        size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+        result = {
+            'returncode': None,
+            'stdout': None,
+            'stdout_path': stdout_file_path,
+            'stdout_size': size,
+            'stderr': e.stderr if hasattr(e, 'stderr') else None,
+            'success': False,
+            'error': 'timeout',
+            'timeout': timeout
+        }
+    except Exception as e:
+        result = {
+            'returncode': None,
+            'stdout': None,
+            'stdout_path': stdout_file_path,
+            'stdout_size': 0,
+            'stderr': None,
+            'success': False,
+            'error': str(e)
+        }
+    finally:
+        try:
+            conn.send(result)
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+
 def _classify_returncode(returncode: Optional[int]) -> Dict[str, Any]:
     """
     Classify subprocess return code to detect signal kills.
@@ -159,7 +228,8 @@ def run_subprocess_safe(
     timeout: float,
     cwd: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
-    text: bool = False
+    text: bool = False,
+    stdout_to_file: bool = False
 ) -> Dict[str, Any]:
     """
     Safely run a subprocess command, preventing fork crashes on macOS.
@@ -178,22 +248,80 @@ def run_subprocess_safe(
         cwd: Working directory (optional)
         env: Environment variables dict (optional)
         text: If True, return stdout/stderr as strings instead of bytes
+        stdout_to_file: If True, write child stdout to a temp file and return
+            stdout_path and stdout_size instead of stdout bytes (avoids large pipe on macOS).
+            Caller must read and delete the file.
         
     Returns:
         Dict with CompletedProcess-like fields:
         - 'returncode': int or None
-        - 'stdout': bytes or str (depending on text parameter)
+        - 'stdout': bytes or str (None if stdout_to_file=True)
+        - 'stdout_path': str (only if stdout_to_file=True)
+        - 'stdout_size': int (only if stdout_to_file=True)
         - 'stderr': bytes or str (depending on text parameter)
-        - 'success': bool (True if subprocess.run() completed without exception)
-        - 'signal_num': int or None (signal number if killed by signal)
-        - 'signal_name': str or None (human-readable signal name)
-        - 'is_signal_kill': bool (True if process was killed by signal)
-        - 'error': str or None (error message if subprocess.run() raised exception)
-        - 'timeout': float or None (timeout value if TimeoutExpired)
+        - 'success': bool
+        - plus signal/error/timeout fields as before
     """
+    stdout_file_path = None
+    if stdout_to_file:
+        fd, stdout_file_path = tempfile.mkstemp(prefix="stream_checker_stdout_", suffix=".bin")
+        os.close(fd)
+
+    def _result_stdout_to_file(path: str, size: int) -> Dict[str, Any]:
+        return {
+            'stdout': None,
+            'stdout_path': path,
+            'stdout_size': size,
+        }
+
     # Check if we're already in a helper process (prevents nested spawn)
     if os.environ.get('STREAM_CHECKER_SUBPROCESS_HELPER') == '1':
         # Already in helper process - call subprocess.run() directly
+        if stdout_to_file and stdout_file_path:
+            try:
+                with open(stdout_file_path, 'wb') as fout:
+                    process = subprocess.run(
+                        cmd,
+                        stdout=fout,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout,
+                        cwd=cwd,
+                        env=env,
+                        text=text
+                    )
+                size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+                signal_info = _classify_returncode(process.returncode)
+                return {
+                    'returncode': process.returncode,
+                    'stderr': process.stderr,
+                    'success': True,
+                    **_result_stdout_to_file(stdout_file_path, size),
+                    **signal_info
+                }
+            except subprocess.TimeoutExpired as e:
+                size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+                return {
+                    'returncode': None,
+                    'stderr': e.stderr if hasattr(e, 'stderr') else None,
+                    'success': False,
+                    'error': 'timeout',
+                    'timeout': timeout,
+                    **_result_stdout_to_file(stdout_file_path, size),
+                    'signal_num': None,
+                    'signal_name': None,
+                    'is_signal_kill': False
+                }
+            except Exception as e:
+                return {
+                    'returncode': None,
+                    'stderr': None,
+                    'success': False,
+                    'error': str(e),
+                    **_result_stdout_to_file(stdout_file_path, 0),
+                    'signal_num': None,
+                    'signal_name': None,
+                    'is_signal_kill': False
+                }
         try:
             process = subprocess.run(
                 cmd,
@@ -244,97 +372,65 @@ def run_subprocess_safe(
         parent_conn = None
         child_conn = None
         process_obj = None
-        
+
+        def _macos_error(**kwargs):
+            base = {'stdout': None, 'stderr': None, 'success': False, 'signal_num': None, 'signal_name': None, 'is_signal_kill': False}
+            if stdout_to_file and stdout_file_path:
+                base['stdout_path'] = stdout_file_path
+                base['stdout_size'] = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+            base.update(kwargs)
+            return base
+
         try:
             # Create Pipe (one-way: parent receives, child sends)
             parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
             
             # Prepare env for child process - merge with current environment and add helper flag
-            # This allows nested calls to detect they're in a helper process
             child_env = dict(os.environ)
             if env:
                 child_env.update(env)
             child_env['STREAM_CHECKER_SUBPROCESS_HELPER'] = '1'
             
-            # Create process
-            process_obj = multiprocessing.Process(
-                target=_subprocess_worker_pipe,
-                args=(child_conn, cmd, timeout, cwd, child_env, text)
-            )
+            if stdout_to_file and stdout_file_path:
+                process_obj = multiprocessing.Process(
+                    target=_subprocess_worker_stdout_to_file,
+                    args=(child_conn, cmd, timeout, cwd, child_env, text, stdout_file_path)
+                )
+            else:
+                process_obj = multiprocessing.Process(
+                    target=_subprocess_worker_pipe,
+                    args=(child_conn, cmd, timeout, cwd, child_env, text)
+                )
             
-            # Start process
             process_obj.start()
-            # Close child end in parent process
             child_conn.close()
             
-            # Wait for process with timeout (add buffer for process overhead)
             process_obj.join(timeout=timeout + 5.0)
             
-            # Check if process timed out
             if process_obj.is_alive():
                 process_obj.terminate()
                 process_obj.join(timeout=2.0)
                 if process_obj.is_alive():
                     process_obj.kill()
                     process_obj.join()
-                return {
-                    'returncode': None,
-                    'stdout': None,
-                    'stderr': None,
-                    'success': False,
-                    'error': 'multiprocessing worker timeout',
-                    'signal_num': None,
-                    'signal_name': None,
-                    'is_signal_kill': False
-                }
+                return _macos_error(error='multiprocessing worker timeout')
             
-            # Check process exit code for signals or errors
             exitcode = process_obj.exitcode
             if exitcode is not None and exitcode != 0:
-                # Worker process crashed - classify the signal
                 signal_info = _classify_returncode(exitcode)
-                return {
-                    'returncode': None,
-                    'stdout': None,
-                    'stderr': None,
-                    'success': False,
-                    'error': f'multiprocessing worker crashed with exitcode {exitcode}',
-                    **signal_info
-                }
+                return _macos_error(error=f'multiprocessing worker crashed with exitcode {exitcode}', **signal_info)
             
-            # Get result from pipe
             try:
                 if parent_conn.poll():
                     result = parent_conn.recv()
                     if result:
-                        # Classify returncode for signal kills
                         signal_info = _classify_returncode(result.get('returncode'))
                         result.update(signal_info)
                         return result
-                else:
-                    # No data in pipe - process may have crashed
-                    return {
-                        'returncode': None,
-                        'stdout': None,
-                        'stderr': None,
-                        'success': False,
-                        'error': 'no result from multiprocessing worker',
-                        'signal_num': None,
-                        'signal_name': None,
-                        'is_signal_kill': False
-                    }
+                return _macos_error(error='no result from multiprocessing worker')
             except Exception as e:
                 logger.debug(f"Error receiving from pipe: {e}")
-                return {
-                    'returncode': None,
-                    'stdout': None,
-                    'stderr': None,
-                    'success': False,
-                    'error': f'error receiving result: {e}',
-                    'signal_num': None,
-                    'signal_name': None,
-                    'is_signal_kill': False
-                }
+                return _macos_error(error=f'error receiving result: {e}')
         
         except Exception as e:
             logger.debug(f"Error in run_subprocess_safe (macOS): {e}")
@@ -368,6 +464,51 @@ def run_subprocess_safe(
                     pass
     else:
         # Non-macOS: Use subprocess.run() directly
+        if stdout_to_file and stdout_file_path:
+            try:
+                with open(stdout_file_path, 'wb') as fout:
+                    process = subprocess.run(
+                        cmd,
+                        stdout=fout,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout,
+                        cwd=cwd,
+                        env=env,
+                        text=text
+                    )
+                size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+                signal_info = _classify_returncode(process.returncode)
+                return {
+                    'returncode': process.returncode,
+                    'stderr': process.stderr,
+                    'success': True,
+                    **_result_stdout_to_file(stdout_file_path, size),
+                    **signal_info
+                }
+            except subprocess.TimeoutExpired as e:
+                size = os.path.getsize(stdout_file_path) if os.path.exists(stdout_file_path) else 0
+                return {
+                    'returncode': None,
+                    'stderr': e.stderr if hasattr(e, 'stderr') else None,
+                    'success': False,
+                    'error': 'timeout',
+                    'timeout': timeout,
+                    **_result_stdout_to_file(stdout_file_path, size),
+                    'signal_num': None,
+                    'signal_name': None,
+                    'is_signal_kill': False
+                }
+            except Exception as e:
+                return {
+                    'returncode': None,
+                    'stderr': None,
+                    'success': False,
+                    'error': str(e),
+                    **_result_stdout_to_file(stdout_file_path, 0),
+                    'signal_num': None,
+                    'signal_name': None,
+                    'is_signal_kill': False
+                }
         try:
             process = subprocess.run(
                 cmd,

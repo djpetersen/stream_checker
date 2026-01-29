@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+import time
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import logging
@@ -11,6 +12,42 @@ from stream_checker.utils.file_utils import safe_remove_file
 from stream_checker.utils.subprocess_utils import run_subprocess_safe
 
 logger = logging.getLogger("stream_checker")
+
+AUDIO_DEBUG = os.environ.get("STREAM_CHECKER_AUDIO_DEBUG") == "1"
+
+
+def _log_ffmpeg_debug(
+    phase: str,
+    argv: list,
+    timeout: float,
+    elapsed_sec: float,
+    result: Dict[str, Any],
+    output_size: int,
+    output_label: str,
+    stderr_max_chars: int = 2000,
+    progress_snippet: Optional[str] = None,
+) -> None:
+    """High-signal debug log for one ffmpeg call. No-op when STREAM_CHECKER_AUDIO_DEBUG != 1."""
+    if not AUDIO_DEBUG:
+        return
+    returncode = result.get("returncode")
+    stderr_raw = result.get("stderr")
+    stderr_preview = ""
+    if stderr_raw is not None:
+        try:
+            stderr_preview = stderr_raw.decode("utf-8", errors="replace")[:stderr_max_chars]
+        except Exception:
+            stderr_preview = str(stderr_raw)[:stderr_max_chars]
+    err = result.get("error")
+    is_timeout = err == "timeout" or (isinstance(err, str) and "timeout" in err.lower())
+    is_signal = returncode is not None and returncode < 0
+    msg = (
+        "[AUDIO_DEBUG] phase=%s argv=%s timeout=%s elapsed_sec=%.2f returncode=%s is_timeout=%s is_signal=%s %s=%s stderr_preview=%s"
+        % (phase, argv, timeout, elapsed_sec, returncode, is_timeout, is_signal, output_label, output_size, repr(stderr_preview))
+    )
+    if progress_snippet:
+        msg += " progress_snippet=%s" % repr(progress_snippet)
+    logger.info(msg)
 
 
 class AudioAnalyzer:
@@ -222,10 +259,22 @@ class AudioAnalyzer:
                 logger.debug(f"Trying download strategy: {strategy_name} for {url}")
                 
                 # Run ffmpeg with timeout - use run_subprocess_safe (detects helper process to avoid nested spawn)
+                t0 = time.perf_counter()
                 result = run_subprocess_safe(
                     cmd,
                     timeout=timeout,
                     text=False
+                )
+                elapsed_sec = time.perf_counter() - t0
+                bytes_written = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                _log_ffmpeg_debug(
+                    "download",
+                    cmd,
+                    timeout,
+                    elapsed_sec,
+                    result,
+                    bytes_written,
+                    "bytes_written",
                 )
                 
                 process_returncode = result.get('returncode')
@@ -274,7 +323,8 @@ class AudioAnalyzer:
         ffmpeg_path = self._find_ffmpeg()
         if not ffmpeg_path:
             return None, 0, 0
-        
+
+        progress_path = None
         try:
             # Use ffmpeg to convert to raw PCM (16-bit signed, little-endian)
             cmd = [
@@ -286,20 +336,55 @@ class AudioAnalyzer:
                 "-ac", "2",  # Stereo
                 "-"  # Output to stdout
             ]
-            
-            # Use run_subprocess_safe (detects helper process to avoid nested spawn)
+            if AUDIO_DEBUG:
+                fd, progress_path = tempfile.mkstemp(prefix="stream_checker_progress_", suffix=".txt")
+                os.close(fd)
+                cmd = [ffmpeg_path, "-loglevel", "verbose", "-stats", "-i", audio_file, "-progress", progress_path] + cmd[cmd.index("-f"):]
+
+            # Use run_subprocess_safe with stdout_to_file so child writes PCM to a temp file (avoids large pipe on macOS)
+            t0 = time.perf_counter()
             result = run_subprocess_safe(
                 cmd,
                 timeout=30,
-                text=False
+                text=False,
+                stdout_to_file=True
+            )
+            elapsed_sec = time.perf_counter() - t0
+            stdout_path = result.get('stdout_path')
+            stdout_len = result.get('stdout_size') or 0
+
+            progress_snippet = None
+            if AUDIO_DEBUG and progress_path:
+                if not result.get("success") or result.get("error") == "timeout" or result.get("returncode") not in (None, 0):
+                    try:
+                        with open(progress_path, "r", encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
+                        tail = lines[-50:] if len(lines) > 50 else lines
+                        progress_snippet = "".join(tail)
+                        if len(progress_snippet) > 4096:
+                            progress_snippet = progress_snippet[-4096:]
+                    except Exception as e:
+                        progress_snippet = "(read failed: %s)" % e
+
+            _log_ffmpeg_debug(
+                "load_raw",
+                cmd,
+                30,
+                elapsed_sec,
+                result,
+                stdout_len,
+                "len_stdout",
+                stderr_max_chars=4096,
+                progress_snippet=progress_snippet,
             )
             
             process_returncode = result.get('returncode')
-            process_stdout = result.get('stdout')
             process_stderr = result.get('stderr')
             
             # Check for subprocess failures (timeout, etc.)
             if not result.get('success', False):
+                if stdout_path and os.path.exists(stdout_path):
+                    safe_remove_file(stdout_path, context="_load_audio_raw stdout")
                 error_msg = result.get('error', 'Unknown error')
                 stderr_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "No stderr captured"
                 logger.error(f"ffmpeg conversion failed: {error_msg}, stderr: {stderr_msg[:500]}")
@@ -307,12 +392,20 @@ class AudioAnalyzer:
                 return None, 0, 0
             
             if process_returncode != 0:
+                if stdout_path and os.path.exists(stdout_path):
+                    safe_remove_file(stdout_path, context="_load_audio_raw stdout")
                 error_msg = process_stderr.decode('utf-8', errors='ignore') if process_stderr else "Unknown error"
                 logger.error(f"ffmpeg conversion failed: {error_msg}")
                 return None, 0, 0
             
-            # Convert bytes to numpy array
-            raw_data = process_stdout
+            # Read PCM bytes from temp file (caller is responsible for cleanup)
+            raw_data = None
+            if stdout_path and os.path.exists(stdout_path):
+                try:
+                    with open(stdout_path, 'rb') as f:
+                        raw_data = f.read()
+                finally:
+                    safe_remove_file(stdout_path, context="_load_audio_raw stdout")
             if not raw_data or len(raw_data) == 0:
                 logger.error("ffmpeg produced no audio data")
                 return None, 0, 0
@@ -353,6 +446,9 @@ class AudioAnalyzer:
         except Exception as e:
             logger.error(f"Error loading audio: {e}")
             return None, 0, 0
+        finally:
+            if progress_path and os.path.exists(progress_path):
+                safe_remove_file(progress_path, context="_load_audio_raw progress")
     
     def _detect_silence(self, samples: np.ndarray, sample_rate: int, channels: int, result: Dict[str, Any]):
         """Detect silence periods in audio"""
